@@ -197,3 +197,48 @@ def project_latent(W, L, Phi, d, y_concat, x_dims):
     posterior_x_mean = posterior_z_x_mean[d:]
 
     return posterior_z_mean.T, posterior_x_mean.T
+
+
+def project_latent_individual(W, L, Phi, d, y_concat, x_dims, y_dims, nth_dataset):
+    # get dimension of dataset of interest
+    prev_dims = torch.sum(y_dims[:nth_dataset]).item()
+    cur_dim = y_dims[nth_dataset]
+    cur_W = W[prev_dims:prev_dims+cur_dim, :]
+    cur_L = L[prev_dims:prev_dims+cur_dim, :]
+    cur_Phi = Phi
+
+    # transpose dataset for easier manipulation
+    y_concat_T = y_concat[:, prev_dims:prev_dims+cur_dim].T
+    sigma_22_inv = torch.inverse(cur_W@cur_W.T + cur_L @ cur_L.T + cur_Phi*torch.eye(cur_W.shape[0]))
+
+    # other necessary block matrices
+    sigma_12 = torch.cat([cur_W.T, cur_L.T], axis=0)
+    sigma_11 = torch.eye(y_dims[nth_dataset]+d)
+
+    # compute the posterior mean of z and x; y should be a matrix with all samples aligned as columns
+    posterior_z_x_mean = sigma_12 @ sigma_22_inv @ y_concat_T
+    posterior_z_mean = posterior_z_x_mean[:d]
+    posterior_x_mean = posterior_z_x_mean[d:]
+
+    return posterior_z_mean.T, posterior_x_mean.T
+
+
+def compute_ISC(*all_ys):
+    # setup for processing and computation of ISC
+    datasets = [*all_ys]
+    N_sets = len(datasets)
+
+    # de-mean each individual CCA projection
+    for i in range(N_sets):
+        datasets[i] = datasets[i] - torch.mean(datasets[i], axis=1, keepdim=True)
+
+    # ISC explained by each canonical component
+    rb = torch.zeros(datasets[0].shape[1])    
+    rw = torch.zeros(datasets[0].shape[1])
+    # compute the b/w set correlation 
+    for i in range(N_sets):
+        for j in range(i+1, N_sets):
+            rb += torch.sum(torch.mul(datasets[i], datasets[j]), axis=0)
+        rw += torch.sum(torch.pow(datasets[i], 2), axis=0)
+    rho = rb / rw
+    return rho, rb, rw
