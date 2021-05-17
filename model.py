@@ -3,52 +3,52 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-def E_step(W, L, Phi, x_dims, d, y_i):
+def E_step(W, L, Phi, x_dims, d, y_i, device='cpu'):
     # schur-complement (M/D)^{-1}; need to make sure that this is not blowing up!
-    sigma_22_inv = torch.inverse(W@W.T + L @ L.T + Phi)
+    sigma_22_inv = torch.inverse(W@W.T + L @ L.T + Phi).to(device)
     #     print(sigma_22_inv)
 
     # other necessary block matrices
-    sigma_12 = torch.cat([W.T, L.T], axis=0)
-    sigma_11 = torch.eye(torch.sum(x_dims)+d)
+    sigma_12 = torch.cat([W.T, L.T], axis=0).to(device)
+    sigma_11 = torch.eye(torch.sum(x_dims)+d).to(device)
 
     # compute the posterior mean of z and x; y should be a matrix with all samples aligned as columns
     posterior_z_x_mean = sigma_12 @ sigma_22_inv @ (y_i)
-    posterior_z_mean = posterior_z_x_mean[:d]
-    posterior_x_mean = posterior_z_x_mean[d:]
+    posterior_z_mean = posterior_z_x_mean[:d].to(device)
+    posterior_x_mean = posterior_z_x_mean[d:].to(device)
 
     # posterior covariance
     posterior_x1_cov = sigma_11 - sigma_12 @ sigma_22_inv @ sigma_12.T
-    posterior_z_x_cov = posterior_x1_cov[:d, d:]  # cross covariance
-    posterior_z_z_cov = posterior_x1_cov[:d, :d]  # upper left block matrix
-    posterior_x_x_cov = posterior_x1_cov[d:, d:]  # bottom right block matrix
+    posterior_z_x_cov = posterior_x1_cov[:d, d:].to(device)  # cross covariance
+    posterior_z_z_cov = posterior_x1_cov[:d, :d].to(device)  # upper left block matrix
+    posterior_x_x_cov = posterior_x1_cov[d:, d:].to(device)  # bottom right block matrix
     
     # need to batch zmu and xmu: [n_samples, <[z, x]>.shape, 1]
-    zmu_batched = posterior_z_mean.T[:, :, None]
-    xmu_batched = posterior_x_mean.T[:, :, None]
+    zmu_batched = posterior_z_mean.T[:, :, None].to(device)
+    xmu_batched = posterior_x_mean.T[:, :, None].to(device)
 
     # posterior <zx.T> = cov(z, x) + <z><x.T>
-    posterior_zxT = posterior_z_x_cov + zmu_batched @ xmu_batched.permute(0, 2, 1)  # shape: (n_samples, z_dim, x_dim)
-    posterior_zzT = posterior_z_z_cov + zmu_batched @ zmu_batched.permute(0, 2, 1)  # shape: (n_samples, z_dim, z_dim)
-    posterior_xxT = posterior_x_x_cov + xmu_batched @ xmu_batched.permute(0, 2, 1)  # shape: (n_samples, x_dim, x_dim)
+    posterior_zxT = (posterior_z_x_cov + zmu_batched @ xmu_batched.permute(0, 2, 1)).to(device)  # shape: (n_samples, z_dim, x_dim)
+    posterior_zzT = (posterior_z_z_cov + zmu_batched @ zmu_batched.permute(0, 2, 1)).to(device)  # shape: (n_samples, z_dim, z_dim)
+    posterior_xxT = (posterior_x_x_cov + xmu_batched @ xmu_batched.permute(0, 2, 1)).to(device)  # shape: (n_samples, x_dim, x_dim)
 
     return posterior_zxT, posterior_zzT, posterior_xxT, zmu_batched, xmu_batched
 
 
-def M_step(zxT, zzT, xxT, zmu, xmu, y_i, Phi_model, L_model, W_model, N):
+def M_step(zxT, zzT, xxT, zmu, xmu, y_i, Phi_model, L_model, W_model, N, device='cpu'):
     # note that in the M-Step, we assume that the variance is diagonal but potentially
     # non-isotropic
-    y_i_batched = y_i[:, :, None]  # (n_samples, batch_dim, 1)
-    new_L = torch.sum(y_i_batched @ xmu.permute(0, 2, 1) - W_model @ zxT, axis=0) @ torch.inverse(torch.sum(xxT, axis=0))
-    new_W = torch.sum(y_i_batched @ zmu.permute(0, 2, 1) - L_model @ zxT.permute(0, 2, 1), axis=0) @ torch.inverse(torch.sum(zzT, axis=0))
-    new_Phi = 1 / N * torch.sum(y_i_batched @ y_i_batched.permute(0, 2, 1) + \
+    y_i_batched = y_i[:, :, None].to(device)  # (n_samples, batch_dim, 1)
+    new_L = torch.sum(y_i_batched @ xmu.permute(0, 2, 1) - W_model @ zxT, axis=0) @ torch.inverse(torch.sum(xxT, axis=0)).to(device)
+    new_W = torch.sum(y_i_batched @ zmu.permute(0, 2, 1) - L_model @ zxT.permute(0, 2, 1), axis=0) @ torch.inverse(torch.sum(zzT, axis=0)).to(device)
+    new_Phi = (1 / N * torch.sum(y_i_batched @ y_i_batched.permute(0, 2, 1) + \
                                 L_model @ xxT @ L_model.T + \
                                 W_model @ zzT @ W_model.T + \
                                 2 * L_model @ zxT.permute(0, 2, 1) @ W_model.T + \
                                 -2 * y_i_batched @ zmu.permute(0, 2, 1) @ W_model.T + \
-                                -2 * y_i_batched @ xmu.permute(0, 2, 1) @ L_model.T, axis=0)
+                                -2 * y_i_batched @ xmu.permute(0, 2, 1) @ L_model.T, axis=0)).to(device)
 
-    new_Phi = torch.diag(torch.diagonal(new_Phi))  # only update the diagonal components
+    new_Phi = torch.diag(torch.diagonal(new_Phi)).to(device)  # only update the diagonal components
     return new_W, new_L, new_Phi
 
 
@@ -105,7 +105,7 @@ def initialize_model(y_dims, x_dims, datasets, d=5, std=2, mean=0):
         Ls_to_stack.append(cur_L)
         Phis_to_stack.append(cur_Phi)
 
-    return torch.cat(Ws_to_stack, axis=0), torch.block_diag(*Ls_to_stack), torch.block_diag(*Phis_to_stack)
+    return torch.cat(Ws_to_stack, axis=0).double(), torch.block_diag(*Ls_to_stack).double(), torch.block_diag(*Phis_to_stack).double()
 
 
 # the E-Step required values (is there a way to batch this intelligently?)
@@ -256,9 +256,10 @@ def fit_isotropic_model(y_dims, x_dims, datasets, d, y_concat, N, eps=1e-6, step
     return W_model, L_model, Phi_model
 
 
-def project_latent(W, L, Phi, d, y_concat, x_dims):
+def project_latent(W, L, Phi, d, y_concat, x_dims, isotropic=False):
     y_concat_T = y_concat.T
-    sigma_22_inv = torch.inverse(W@W.T + L @ L.T + Phi*torch.eye(W.shape[0]))
+    var_term = Phi*torch.eye(W.shape[0]) if isotropic else Phi
+    sigma_22_inv = torch.inverse(W@W.T + L @ L.T + var_term)
     #     print(sigma_22_inv)
 
     # other necessary block matrices
@@ -273,17 +274,18 @@ def project_latent(W, L, Phi, d, y_concat, x_dims):
     return posterior_z_mean.T, posterior_x_mean.T
 
 
-def project_latent_individual(W, L, Phi, d, y_concat, x_dims, y_dims, nth_dataset):
+def project_latent_individual(W, L, Phi, d, y_concat, x_dims, y_dims, nth_dataset, isotropic=False):
     # get dimension of dataset of interest
     prev_dims = torch.sum(y_dims[:nth_dataset]).item()
     cur_dim = y_dims[nth_dataset]
     cur_W = W[prev_dims:prev_dims+cur_dim, :]
     cur_L = L[prev_dims:prev_dims+cur_dim, :]
     cur_Phi = Phi
-
+    
+    var_term = cur_Phi * torch.eye(cur_W.shape[0]) if isotropic else cur_Phi[prev_dims:prev_dims+cur_dim, prev_dims:prev_dims+cur_dim]
     # transpose dataset for easier manipulation
     y_concat_T = y_concat[:, prev_dims:prev_dims+cur_dim].T
-    sigma_22_inv = torch.inverse(cur_W@cur_W.T + cur_L @ cur_L.T + cur_Phi*torch.eye(cur_W.shape[0]))
+    sigma_22_inv = torch.inverse(cur_W@cur_W.T + cur_L @ cur_L.T + var_term)
 
     # other necessary block matrices
     sigma_12 = torch.cat([cur_W.T, cur_L.T], axis=0)
@@ -318,13 +320,21 @@ def compute_ISC(*all_ys):
     return rho, rb, rw
 
 
-def fit_model(y_dims, x_dims, datasets, d, y_concat, N, eps=1e-6, steps=5000):
+def fit_model(y_dims, x_dims, datasets, d, y_concat, N, eps=1e-6, steps=5000, device='cpu'):
     torch.set_num_threads(20)
+    device = torch.device(device)
 
-    y_concat_T = y_concat.T
+    y_concat_T = y_concat.T.to(device)
 
     # initialize the model parameters
     W_model, L_model, Phi_model = initialize_model(y_dims, x_dims, datasets, d=d)
+
+    # move parameters to device 
+    W_model = W_model.to(device)
+    L_model = L_model.to(device)
+    Phi_model = Phi_model.to(device)
+    y_concat = y_concat.to(device)
+    y_concat_T = y_concat_T.to(device)
 
     #print(W_model.shape)
     #print(L_model.shape)
@@ -338,11 +348,11 @@ def fit_model(y_dims, x_dims, datasets, d, y_concat, N, eps=1e-6, steps=5000):
     # iterate through E/M Steps
     for i in range(steps):
         # E-Step, then M-Step
-        zxT, zzT, xxT, zmu, xmu = E_step(W_model, L_model, Phi_model, x_dims, d, y_concat_T)
-        W_tprime, L_tprime, Phi_tprime = M_step(zxT, zzT, xxT, zmu, xmu, y_concat, Phi_model, L_model, W_model, N)
+        zxT, zzT, xxT, zmu, xmu = E_step(W_model, L_model, Phi_model, x_dims, d, y_concat_T, device=device)
+        W_tprime, L_tprime, Phi_tprime = M_step(zxT, zzT, xxT, zmu, xmu, y_concat, Phi_model, L_model, W_model, N, device=device)
 
         # compute updated L 
-        L_tupdate = torch.zeros_like(L_tprime)
+        L_tupdate = torch.zeros_like(L_tprime).to(device)
 
         # careful when updating L_model; have to make sure to keep terms that allow
         # interaction of private structure across datasets fixed at 0 
@@ -365,9 +375,9 @@ def fit_model(y_dims, x_dims, datasets, d, y_concat, N, eps=1e-6, steps=5000):
         Phi_diffs.append(Phi_diff)
         
         # update parameters
-        W_model = W_tprime
-        Phi_model = Phi_tprime
-        L_model = L_tupdate
+        W_model = W_tprime.to(device)
+        Phi_model = Phi_tprime.to(device)
+        L_model = L_tupdate.to(device)
 
         # check for convergence
         if W_diff <= eps and L_diff <= eps and Phi_diff <= eps:
