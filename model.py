@@ -296,6 +296,11 @@ def project_latent_individual(W, L, Phi, d, y_concat, x_dims, y_dims, nth_datase
     posterior_z_mean = posterior_z_x_mean[:d]
     posterior_x_mean = posterior_z_x_mean[d:]
 
+    # slice x to contain only the inferred private space of the specified dataset
+    prev_x_dims = torch.sum(x_dims[:nth_dataset]).item()
+    cur_x_dim = x_dims[nth_dataset]
+    posterior_x_mean = posterior_x_mean[prev_x_dims:prev_x_dims+cur_x_dim, :]
+
     return posterior_z_mean.T, posterior_x_mean.T
 
 
@@ -420,3 +425,14 @@ def fit_model(y_dims, x_dims, datasets, d, y_concat, N, eps=1e-6, steps=5000, de
     plt.clf()
 
     return W_model, L_model, Phi_model
+
+
+def compute_x_cov(posterior_x_mu):
+    # compute empirical covariance of predicted private space
+    # posterior_x_mu must be of dimension (n_samples x private_x_dim)
+    # returns: 
+    #         posterior_cov: posterior covariance matrix 
+    #         torch.diagonal(^): diagonal view of posterior cov
+    posterior_cov = posterior_x_mu.T @ posterior_x_mu
+
+    return posterior_cov, torch.diagonal(posterior_cov)
