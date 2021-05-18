@@ -1,6 +1,6 @@
 import argparse
 import torch
-import os
+import os 
 import importlib
 import pandas as pd
 import numpy as np
@@ -16,7 +16,7 @@ def parse_args():
     parser.add_argument('-x2', type=int, default=5, help='Dimension of private space for dataset 2')
     parser.add_argument('--steps', type=int, default=2000, help='Max # of E/M Steps to run')
     parser.add_argument('--outdir', type=str, default='./', help='Output directory to store .npy files')
-
+    parser.add_argument('--isotropic', action='store_true', help='Use isotropic covariance model')
     return parser.parse_args()
 
 if __name__ == '__main__':
@@ -41,11 +41,19 @@ if __name__ == '__main__':
     # get y dimensions and number of samples
     y_dims = torch.tensor([dataset_1.shape[1], dataset_2.shape[1]])
     n_samples = dataset_1.shape[0]
+    device = 'cpu'
+    if torch.cuda.is_available():
+        device = 'cuda'
 
     # concatenate y's for each sample together to prepare to fit model 
-    y_concat = torch.cat(datasets, axis=1).float()
-    W_model, L_model, Phi_model = fit_model(y_dims, x_dims, datasets, d, y_concat, n_samples, steps=args.steps) 
-    posterior_z, posterior_x = project_latent(W_model, L_model, Phi_model, d, y_concat, x_dims)
+    y_concat = torch.cat(datasets, axis=1).double()
+    W_model, L_model, Phi_model = fit_model(y_dims, x_dims, datasets, d, y_concat, n_samples, steps=args.steps, device=device)
+    W_model = W_model.cpu()
+    L_model = L_model.cpu()
+    Phi_model = Phi_model.cpu()
+
+    # default setting for isotropic is False (i.e. diagonal covariance model with potentially non-iso variance)
+    posterior_z, posterior_x = project_latent(W_model, L_model, Phi_model, d, y_concat, x_dims, isotropic=args.isotropic)
 
     # extract data-set specific projection matrices 
     pd.DataFrame(W_model[:y_dims[0], :].numpy()).to_csv(os.path.join(outdir, 'dataset1_W.csv'), header=False, index=False)
