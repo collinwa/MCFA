@@ -436,3 +436,24 @@ def compute_x_cov(posterior_x_mu):
     posterior_cov = posterior_x_mu.T @ posterior_x_mu
 
     return posterior_cov, torch.diagonal(posterior_cov)
+
+def slice_private_projection(projection, x_dims):
+    """Slice the concatenated private space projections that 
+    are returned after conditioning on all data for a given sample
+
+    Args:
+        projection: torch.tensor of shape (n_samples x sum(x_dims))
+        x_dims: torch tensor of size (n_datasets), each dataset private space dimension
+            in order of concatenation 
+    returns:
+        all_projections: list of tensors of length (n_datasets) of private space
+            projection for every dataset
+    """
+
+    all_projections = []
+    for idx, dim in enumerate(x_dims):
+        prev_dims = torch.sum(x_dims[:idx])
+        all_projections.append(projection[:, prev_dims:prev_dims+dim]) 
+
+    return all_projections
+
