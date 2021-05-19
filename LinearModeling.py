@@ -182,3 +182,13 @@ def fit_categorical_lm(df,
 
     return all_models
 
+
+def LinearRegression(mat, labels):
+    # mat must be of shape (n_samples x k_features+1)
+    # note: a column of ones is used to allow us to model 
+    # affine functions as well
+    mat = np.concatenate([mat, np.ones(len(mat), 1)], axis=1)
+    lin_params = np.linalg.inv(mat.T @ mat) @ mat.T @ labels
+    y_hat = mat @ lin_params
+    return lin_params, y_hat
+
