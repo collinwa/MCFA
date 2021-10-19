@@ -94,7 +94,7 @@ def micca_nopc(data_pcs: List[PCARes],
         c_shared = min(dimensions)
 
     if c_private is None:
-        c_private = dimensions - c_shared
+        c_private = [d - c_shared for d in dimensions]
 
     U_splits = [data_pc.U[:, 0:k] for data_pc, k in zip(data_pcs, dimensions)]
     U_all = torch.cat(U_splits, dim=1)
@@ -105,7 +105,7 @@ def micca_nopc(data_pcs: List[PCARes],
     rho = values[0:c_shared] - 1
     V = np.sqrt(n_sets) * vectors[:, 0:c_shared]
     dimsum = np.concatenate([[0], np.cumsum(dimensions, 0)])
-    V_splits = [V[i:j, :] for i, j in zip(dimsum[:-1], dimsum[1:])]
+    V_splits = [V[i:j, :] for i, j in zip(dimsum[:-1], dimsum[1:])]    
 
     # Dataset specific shared views.
     C_each = [U @ V for U, V in zip(U_splits, V_splits)]
@@ -116,10 +116,17 @@ def micca_nopc(data_pcs: List[PCARes],
     Vp = np.sqrt(n_sets) * vectors[:, c_shared:min(dimensions)]
     Vp_splits = [Vp[i:j, :] for i, j in zip(dimsum[:-1], dimsum[1:])]
     Vp_proj_mats = [_make_pmat(Vps, d) for Vps, d in zip(Vp_splits, dimensions)]
-    C_p_svds = [torch.linalg.svd((dpc.U * dpc.lam) @ P, full_matrices = False)
-           for dpc, P, cp in zip(data_pcs, Vp_proj_mats, c_private)]
-    C_private = [C_p_svd.U[:, 1:cp] for C_p_svd, cp in zip(C_p_svds, c_private)]
-    lam_private = [C_p_svd.S[1:cp] for C_p_svd, cp in zip(C_p_svds, c_private)]
+    if c_private is not None:
+        C_p_svds = [torch.linalg.svd((dpc.U * dpc.lam) @ P,
+                                     full_matrices = False)
+                    for dpc, P, cp in zip(data_pcs, Vp_proj_mats, c_private)]
+        C_private = [C_p_svd.U[:, 1:cp]
+                     for C_p_svd, cp in zip(C_p_svds, c_private)]
+        lam_private = [C_p_svd.S[1:cp]
+                       for C_p_svd, cp in zip(C_p_svds, c_private)]
+    else:
+        C_private = None
+        lam_private = None
     return MICCARes(C_all, C_each, rho, C_private, lam_private)
 
 
@@ -144,6 +151,37 @@ def micca(datasets: List[torch.Tensor],
     return micca_nopc(data_pcs, dimensions, c_shared, c_private)
 
 
+def _sqrtm(X):
+    U, l, VT = torch.linalg.svd(X)
+    return (U * torch.sqrt(l)) @ VT
+
+
+def _pinv(X, eps = 1e-6):
+    U, l, VT = torch.linalg.svd(X)
+    l_new = (1/l) * (l > eps)
+    return (U * l_new) @ VT
+
+
+def cca(Y1: torch.Tensor, Y2: torch.Tensor, d: int, center: bool = True):
+    """Basic CCA implementation."""
+    n = Y1.shape[0]
+    if center:
+        Y1 = Y1 - torch.mean(Y1, 0)
+        Y2 = Y2 - torch.mean(Y2, 0)
+    S11 = (Y1.T @ Y1)/(n-1)
+    S22 = (Y2.T @ Y2)/(n-1)
+    S12 = (Y1.T @ Y2)/(n-1)
+
+    S11_inv2 = _sqrtm(_pinv(S11))
+    S22_inv2 = _sqrtm(_pinv(S22))
+    C12_tilde = S11_inv2 @ S12 @ S22_inv2
+
+    V1, rho, V2T = torch.linalg.svd(C12_tilde)
+    F1 = S11_inv2 @ V1[:, 0:d]
+    F2 = S22_inv2 @ V2T.T[:, 0:d]
+    return(F1, F2, rho[0:d], V1[:, 0:d], V2T.T[:, 0:d])
+
+
 # TODO(brielin): Should this bee List[torch.Tensor]?
 #      Looks like no, would have to do lots of copies.
 def EM_step(W: torch.Tensor,
@@ -163,10 +201,10 @@ def EM_step(W: torch.Tensor,
         p: Dimensionality of each dataset.
     """
     d, _ = W.size()
-    Phi_inv = torch.inverse(Phi)
-    M = torch.inverse(torch.eye(d) + W @ Phi_inv @ W.T)
+    Phi_inv = torch.linalg.inv(Phi)
+    M = torch.linalg.pinv(torch.eye(d) + W @ Phi_inv @ W.T)
 
-    Q = torch.inverse(M + M @ W @ Phi_inv @ Sigma_tilde @ Phi_inv @ W.T @ M)
+    Q = torch.linalg.pinv(M + M @ W @ Phi_inv @ Sigma_tilde @ Phi_inv @ W.T @ M)
     W_next = Q @ M @ W @ Phi_inv @ Sigma_tilde
     Phi_next = Sigma_tilde - Sigma_tilde @ Phi_inv @ W.T @ M @ W
     psum = np.concatenate([[0], np.cumsum(p, 0)])
@@ -177,15 +215,16 @@ def EM_step(W: torch.Tensor,
 
 
 #TODO(brielin): Flip these Ws to match math.
-def EM_step_alt(W: torch.Tensor, Phi: torch.Tensor,
-                Y: torch.Tensor, Sigma_tilde: torch.Tensor, p: List[int]):
+def EM_step_stable(W: torch.Tensor, Phi: torch.Tensor,
+                   Y: torch.Tensor, Sigma_tilde: torch.Tensor,
+                   p: List[int], rcond: float = 1e-08):
     d = W.size()[0]
     n = Y.size()[0]
-    S22_inv = torch.inverse(W.T @ W + Phi)
-    E_z = Y @ S22_inv @ W.T  # nxd
-    sum_E_zzT = n*torch.eye(d) - n*(W @ S22_inv @ W.T) + E_z.T @ E_z  # dxd
-    W_next = torch.inverse(sum_E_zzT) @ (E_z.T @ Y) # d x p
-    Phi_next = Sigma_tilde - W_next.T @ W_next
+    Q_inv_WT = torch.linalg.lstsq(W.T @ W + Phi, W.T, rcond=rcond).solution
+    E_z = Y @ Q_inv_WT
+    sum_E_zzT = n*torch.eye(d) - n*(W @ Q_inv_WT) + E_z.T @ E_z
+    W_next = torch.linalg.lstsq(sum_E_zzT, (E_z.T @ Y), rcond=rcond).solution
+    Phi_next = Sigma_tilde - (Y.T @ E_z @ W_next)/n
     psum = np.concatenate([[0], np.cumsum(p, 0)])
     for i_l, i_r in zip(psum[:-1], psum[1:]):
         Phi_next[i_l:i_r, i_r:] = 0
@@ -193,14 +232,28 @@ def EM_step_alt(W: torch.Tensor, Phi: torch.Tensor,
     return W_next, Phi_next
 
 
+def loglik(Sigma: torch.Tensor, Sigma_hat: torch.Tensor, n: int) -> float:
+    p = Sigma.shape[0]
+    l = (n/2)*(p*np.log(2*np.pi) +
+               torch.logdet(Sigma) +
+               torch.trace(torch.linalg.lstsq(Sigma, Sigma_hat).solution))
+    return l
+
+
+def _svd_filter(X, full_matrices = False, eps = 1e-6):
+    U, l, VT = torch.linalg.svd(X, full_matrices = full_matrices)
+    keep = (l/max(l) > eps)
+    return U[:, keep], l[keep], VT[keep, :]
+
+
 def find_ML_params(
         Y: List[torch.Tensor], d = None) -> (torch.Tensor, torch.Tensor):
     n_sets = len(Y)
     n = Y[0].size()[0]
-    p = [Y_m.size()[1] for Y_m in Y]
     Sigma_tildes = [(Y_m.T @ Y_m) / (n - 1) for Y_m in Y]
-    Y_svds = [torch.linalg.svd(Y_m, full_matrices=False) for Y_m in Y]
-    Us, ls, Vs = map(list, zip(*Y_svds))
+    Y_svds = [_svd_filter(Y_m) for Y_m in Y]
+    Us, ls, VTs = map(list, zip(*Y_svds))
+    p = [len(l) for l in ls]
 
     U_all = torch.cat(Us, dim=1)
     M = U_all.T @ U_all
@@ -209,12 +262,12 @@ def find_ML_params(
     vectors = torch.flip(vectors, dims=[1])
 
     if d is None: d = min(p)
-    rho = values[0:d] - 1
+    rho = (values[0:d] - 1)/(n_sets - 1)
     vecs = np.sqrt(n_sets) * vectors[:, 0:d]
     p_sum = np.concatenate([[0], np.cumsum(p, 0)])
     vec_splits = [vecs[i:j, :] for i, j in zip(p_sum[:-1], p_sum[1:])]
-    Fs = [((V.T * l) @ vec)/(np.sqrt(n-1))
-          for V, l, vec in zip(Vs, ls, vec_splits)]
+    Fs = [((VT.T * l) @ vec)/(np.sqrt(n-1))
+          for VT, l, vec in zip(VTs, ls, vec_splits)]
     # Equal to diag(rho) @ F.T.
     W_hat = [(F * torch.sqrt(rho)).T for F in Fs]
     Phi_hat = [Sigma_tilde - W.T @ W
