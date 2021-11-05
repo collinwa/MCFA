@@ -8,8 +8,9 @@ principal components for "informative" analysis as described in Asendorf 2015.
 
 import numpy as np
 import torch
-from typing import List
 from dataclasses import dataclass
+from typing import List
+from sklearn import preprocessing
 
 
 @dataclass
@@ -22,6 +23,7 @@ class PCARes:
     k: int
     n: int
     d: int
+    mp_dim: int
 
 
 @dataclass
@@ -34,16 +36,22 @@ class MICCARes:
     lam_private: torch.Tensor
 
 
-def pca(X: torch.tensor, k: int = None) -> PCARes:
+def pca(X: torch.tensor, k: int = None, center: bool = True,
+        scale: bool = True) -> PCARes:
     """Basic PCA implementation.
 
     Args:
         X: Two-dimesional (n x d) torch.tensor.
         k: Integer. Number of pcs to keep. Default is min(n ,d).
+        center: bool. True to mean-center columns of X.
+        scale: bool. True to variance-scale the columns of X to 1.0.
     Returns:
         A PCARes instance.
     """
-    n, d = X.size()
+    if center | scale:
+        X = torch.from_numpy(preprocessing.scale(
+            X, with_mean=center, with_std=scale, copy=False))
+    n, d = X.shape
     if d > n:
         gram_mat = (X @ X.T) / n
         values, vectors = torch.linalg.eigh(gram_mat)
@@ -56,9 +64,13 @@ def pca(X: torch.tensor, k: int = None) -> PCARes:
     if k is None:
         k = min(n, d)
 
+    mp_lower_bound = 1 + np.sqrt(d / n)
+    keep = values > mp_lower_bound
+    mp_dim = sum(keep)
+
     pcs = vectors[:, 0:k] * values[0:k]
-    var_exp = values[0:k] / torch.sum(values[1:k])
-    return PCARes(pcs, var_exp, vectors, values, k, n, d)
+    var_exp = values[0:k] / torch.sum(values[0:k])
+    return PCARes(pcs, var_exp, vectors, values, k, n, d, mp_dim)
 
 
 def _make_pmat(X: torch.tensor, n: int) -> torch.tensor:
@@ -66,7 +78,8 @@ def _make_pmat(X: torch.tensor, n: int) -> torch.tensor:
     Z = torch.zeros([nrow_x, n - nrow_x])
     top = torch.cat([X @ X.T, Z ], dim = 1)
     bot = torch.cat([Z.transpose_(0, 1), torch.eye(n - nrow_x)], dim = 1)
-    return torch.cat([top, bot], dim = 0)
+    P = torch.cat([top, bot], dim = 0)
+    return P
 
 
 # TODO(brielin): fix to match ML_params (.T missing)
@@ -86,6 +99,7 @@ def micca_nopc(data_pcs: List[PCARes],
             to keep for each dataset.
     """
     n_sets = len(data_pcs)
+    u_dims = [dpc.U.shape[1] for dpc in data_pcs]
 
     if dimensions is None:
         dimensions = [data_pc.k for data_pc in data_pcs]
@@ -102,7 +116,7 @@ def micca_nopc(data_pcs: List[PCARes],
     values, vectors = torch.linalg.eigh(M)
     values = torch.flip(values, dims=[0])
     vectors = torch.flip(vectors, dims=[1])
-    rho = values[0:c_shared] - 1
+    rho = (values[0:c_shared] - 1)/(n_sets - 1)
     V = np.sqrt(n_sets) * vectors[:, 0:c_shared]
     dimsum = np.concatenate([[0], np.cumsum(dimensions, 0)])
     V_splits = [V[i:j, :] for i, j in zip(dimsum[:-1], dimsum[1:])]
@@ -115,11 +129,12 @@ def micca_nopc(data_pcs: List[PCARes],
     # TODO(brielin): double check we want min(dimensions)?
     Vp = np.sqrt(n_sets) * vectors[:, c_shared:min(dimensions)]
     Vp_splits = [Vp[i:j, :] for i, j in zip(dimsum[:-1], dimsum[1:])]
-    Vp_proj_mats = [_make_pmat(Vps, d) for Vps, d in zip(Vp_splits, dimensions)]
+    Vp_proj_mats = [_make_pmat(Vps, d) for Vps, d in zip(Vp_splits, u_dims)]
+    # TODO(brielin): had to add 0:k, but not in R version?
     C_p_svds = [torch.linalg.svd((dpc.U * dpc.lam) @ P, full_matrices = False)
-           for dpc, P, cp in zip(data_pcs, Vp_proj_mats, c_private)]
-    C_private = [C_p_svd.U[:, 1:cp] for C_p_svd, cp in zip(C_p_svds, c_private)]
-    lam_private = [C_p_svd.S[1:cp] for C_p_svd, cp in zip(C_p_svds, c_private)]
+                for dpc, P, cp in zip(data_pcs, Vp_proj_mats, c_private)]
+    C_private = [C_p_svd.U[:, 0:cp] for C_p_svd, cp in zip(C_p_svds, c_private)]
+    lam_private = [C_p_svd.S[0:cp] for C_p_svd, cp in zip(C_p_svds, c_private)]
     return MICCARes(C_all, C_each, rho, C_private, lam_private)
 
 
@@ -191,6 +206,81 @@ def EM_step_alt(W: torch.Tensor, Phi: torch.Tensor,
         Phi_next[i_l:i_r, i_r:] = 0
         Phi_next[i_r:, i_l:i_r] = 0
     return W_next, Phi_next
+
+
+def EM_step_stable(W: torch.Tensor, Phi: torch.Tensor,
+                   Y: torch.Tensor, Sigma_tilde: torch.Tensor,
+                   p: List[int], rcond: float = 1e-08):
+    d = W.size()[0]
+    n = Y.size()[0]
+    Q_inv_WT = torch.linalg.lstsq(W.T @ W + Phi, W.T, rcond=rcond).solution
+    E_z = Y @ Q_inv_WT
+    sum_E_zzT = n*torch.eye(d) - n*(W @ Q_inv_WT) + E_z.T @ E_z
+    W_next = torch.linalg.lstsq(sum_E_zzT, (E_z.T @ Y), rcond=rcond).solution
+    Phi_next = Sigma_tilde - (Y.T @ E_z @ W_next)/n
+    psum = np.concatenate([[0], np.cumsum(p, 0)])
+    for i_l, i_r in zip(psum[:-1], psum[1:]):
+        Phi_next[i_l:i_r, i_r:] = 0
+        Phi_next[i_r:, i_l:i_r] = 0
+    return W_next, Phi_next
+
+
+def fit_EM(datasets: List[torch.Tensor], d: int, niter: int = 100,
+           W0: torch.Tensor = None, Phi0: torch.Tensor = None,
+           method: str = "stable", print_iter = 100):
+    p = [ds.shape[1] for ds in datasets]
+    Y = torch.cat(datasets, 1).float()
+    n = Y.shape[0]
+    Sigma_tilde = (Y.T @ Y) / (n-1)
+
+    if W0 or Phi0 is None:
+        std_normal = torch.distributions.Normal(0, 1)
+    if W0 is None:
+        W0 = std_normal.sample([d, sum(p)])
+    if Phi0 is None:
+        Phi0 = torch.eye(sum(p))
+
+    for i in range(niter):
+        if method == "stable":
+            W1, Phi1 = EM_step_stable(W0, Phi0, Y, Sigma_tilde, p)
+        elif method == "BJ":
+            W1, Phi1 = EM_step(W0, Phi0, Sigma_tilde, p)
+        delta_W = torch.sum((W1 - W0)**2)
+        delta_Phi = torch.sum((Phi1 - Phi0)**2)
+        if i%print_iter == 0:
+            print(delta_W, delta_Phi, loglik(W0.T @ W0 + Phi0, Sigma_tilde, n), loglik(W1.T @ W1 + Phi1, Sigma_tilde, n))
+        W0 = W1
+        Phi0 = Phi1
+    return W0, Phi0
+
+
+def posterior_z(Y: torch.Tensor, W: torch.Tensor, Phi: torch.Tensor,
+                rcond: float = 1e-08):
+    Q_inv_WT = torch.linalg.lstsq(W.T @ W + Phi, W.T, rcond=rcond).solution
+    E_z = Y @ Q_inv_WT
+    return E_z
+
+
+def calc_feature_genvar(W: torch.Tensor):
+    # Note: assumes feautures have been PCAd first (does not whiten W).
+    cov_mats = [(W[i:(i+1), :].T @ W[i:(i+1), :]).fill_diagonal_(1) for i in range(W.shape[0])]
+    gen_vars = [torch.linalg.det(cov_mat) for cov_mat in cov_mats]
+    return gen_vars, cov_mats
+
+
+# def calc_feature_genvar_z(W: torch.Tensor):
+#     # Note: assumes feautures have been PCAd first (does not whiten W).
+#     cov_mats = [(W[i:(i+1), :].T @ W[i:(i+1), :]).fill_diagonal_(1) for i in range(W.shape[0])]
+#     gen_vars = [torch.linalg.det(cov_mat) for cov_mat in cov_mats]
+#     return gen_vars, cov_mats
+
+
+def loglik(Sigma: torch.Tensor, Sigma_hat: torch.Tensor, n: int) -> float:
+    p = Sigma.shape[0]
+    l = (n/2)*(p*np.log(2*np.pi) +
+               torch.logdet(Sigma) +
+               torch.trace(torch.linalg.lstsq(Sigma, Sigma_hat).solution))
+    return l
 
 
 def find_ML_params(
