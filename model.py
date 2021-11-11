@@ -1,16 +1,19 @@
 # pylint: disable=invalid-name
 # pylint: disable-msg=not-callable
+# pylint: disable-msg=E1101, R0913, R0914
 
 """Multi-Set Canonical Correlation Analysis with Private Structure
 
 An implementation of the graphical model using EM described in our paper
 for isotropic / diagonal variance updates, with or without sparsity.
 """
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from typing import List, Tuple
+from functools import partial
+import torch
+from torch.optim import Adam
+import numpy as np
+import matplotlib.pyplot as plt
 
 
 @dataclass
@@ -29,6 +32,89 @@ class MStepRes:
     W: torch.tensor
     L: torch.tensor
     Phi: torch.tensor
+
+
+def _EM_stable(W: torch.tensor,
+               L: torch.tensor,
+               Phi: torch.tensor,
+               x_dims: torch.tensor,
+               y_i: torch.tensor,
+               device='cpu',
+               rcond: float = 1e-08) -> Tuple[torch.tensor,
+                                              torch.tensor,
+                                              torch.tensor]:
+    """Implementation of EM-Step for CCA with private-latent structure
+
+    Args:
+        W: A 2-dimensional torch.tensor (dim_total, d).
+        L: A 2-dimensional torch.tensor (dim_total, k).
+        Phi: A 2-dimensional torch.tensor (dim_total, dim_total).
+        x_dims: A 1-dimensional torch.tensor (n_datasets, ).
+        y_i: A 2-dimensional torch.tensor (dim_total x dim_total).
+        device: String. Where to run torch model ('cpu' or 'gpu').
+        rcond: Float. Used to determine when to stop torch.lstsq.
+
+    Returns:
+        new_Phi, new_L, new_W. Updated Phi, L, W, according to EM 
+        on the likelihood.
+
+    EM-step is derived using the joint distribution (z, x, y)
+    """
+
+    # important model dimensions
+    n = y_i.shape[0]
+    p = y_i.shape[1]
+    d = W.shape[1]
+    k = L.shape[1]
+
+    # sigma_12 = Cov((z, x), y); (d + k, p)
+    sigma_12 = torch.cat([W.T, L.T], axis=0).to(device)
+
+    # (p, d+k)
+    S22inv_S21 = torch.linalg.lstsq(W @ W.T + L @ L.T + Phi, sigma_12.T,
+                                    rcond=rcond).solution
+
+    # E[z, x | y_i, params]; (d+k, n)
+    E_z_x = S22inv_S21.T @ y_i.T
+ 
+    # Recall that <zx.T> w.r.t the posterior is not 0-mean w.r.t
+    # the posterior distribution; it is more closely related
+    # to the second moment. We therefore adjust the quantity
+    # by the product of posterior means.
+    # posterior <zx.T> = cov(z, x) + <z><x.T>
+    # Var((z, x) | y_i, params)
+
+    # only need the sum of the moment matrix
+    mom_zx_zx_sum = (n * torch.eye(k+d).to(device) - \
+                    (n * S22inv_S21.T @ sigma_12.T).to(device) + \
+                    E_z_x @ E_z_x.T).to(device)
+
+    # get the useful sums
+    zz_sum = mom_zx_zx_sum[:d, :d].to(device)
+    zx_sum = mom_zx_zx_sum[:d, d:].to(device)
+    xx_sum = mom_zx_zx_sum[d:, d:].to(device)
+
+    # L-Update
+    # y_i = (n, p)
+    new_W = torch.linalg.lstsq(zz_sum, (y_i.T @ E_z_x[:d, :].T \
+                               - L @ zx_sum.T).T, rcond=rcond).solution.T
+    # compute the W update
+    new_L = torch.linalg.lstsq(xx_sum, (y_i.T @ E_z_x[d:, :].T \
+                               - W @ zx_sum).T, rcond=rcond).solution.T
+
+    # compute the new Phi update
+    new_Phi = y_i.T @ y_i
+    new_Phi += W @ zz_sum @ W.T
+    new_Phi += L @ xx_sum @ L.T
+    new_Phi += 2 * L @ zx_sum.T @ W.T
+    new_Phi -= 2 * y_i.T @ E_z_x[:d, :].T @ W.T
+    new_Phi -= 2 * y_i.T @ E_z_x[d:, :].T @ L.T
+    new_Phi *= 1 / n
+
+    # only update the diagonal components
+    new_Phi = torch.diag(torch.diagonal(new_Phi)).to(device)
+
+    return new_W, new_L, new_Phi
 
 
 def _E_step(W: torch.tensor,
@@ -80,7 +166,7 @@ def _E_step(W: torch.tensor,
     # Var(x | y_i, params)
     posterior_x_x_cov = posterior_x1_cov[d:, d:].to(device)
 
-    # zmu_batched dimension: [n_samples, (d+k), 1]
+    # zmu_batched dimension: [n_samples, (d), 1]
     # [:, None] adds a batch dimension in the None index
     zmu_batched = posterior_z_mean.T[:, :, None].to(device)
     xmu_batched = posterior_x_mean.T[:, :, None].to(device)
@@ -108,6 +194,261 @@ def _E_step(W: torch.tensor,
                     posterior_xxT,
                     zmu_batched,
                     xmu_batched)
+
+
+def _sparse_M_W_obj(W_model: torch.tensor,
+                    L_model: torch.tensor,
+                    zmu: torch.tensor,
+                    xmu: torch.tensor,
+                    y_i: torch.tensor,
+                    zzT: torch.tensor,
+                    zxT: torch.tensor,
+                    eta: float = 1e-3) -> torch.tensor:
+    """Sparse M objective for determining W_t in the next timestep.
+
+    Args:
+        Rmk: All of the below quantities are inferred
+             **per sample**. This means that every matmul
+             is batched using the first dimension. <.> denotes
+             the expectation w.r.t the posterior.
+
+        zxT: torch.tensor. Inferred <zx.T> from E-Step.
+        zzT: torch.tensor. Inferred <zz.T> from E-Step.
+
+             Rmk: Note that this is not necessarily the
+                  covariance of z since z is not 0-mean
+                  w.r.t. the posterior (even though its
+                  marginal distribution is 0-mean). The
+                  same holds w.r.t. the other quantities
+                  we infer that involve inner/outer
+                  products of random vectors.
+
+        xxT: torch.tensor. Inferred <xx.T> from E-Step.
+        zmu: torch.tensor. Inferred <z> from E-Step.
+        xmu: torch.tensor. Inferred <x> from E-Step.
+
+        L_model: torch.tensor (p, k). Current L tensor.
+        W_model: torch.tensor (p, d). Current W tensor.
+
+    Returns:
+        MStepRes instance.
+    """
+ 
+    # make sure batch dimension matches
+    assert zmu.shape[0] == xmu.shape[0]
+    assert zmu.shape[0] == y_i.shape[0]
+    assert zmu.shape[0] == zzT.shape[0]
+
+    # make sure observed dimension matches
+    assert L_model.shape[0] == W_model.shape[0]
+    assert W_model.shape[0] == y_i.shape[1]
+
+    # make sure hidden dimension matches
+    assert W_model.shape[1] == zmu.shape[1]
+    assert L_model.shape[1] == xmu.shape[1]
+ 
+    # we compute a form of generalized lasso
+    # that is, we compute the squared L_2 norm
+    # + a lasso penalty term on W and L, and optimize
+    # this w.r.t. the values in W
+    b = torch.sum(y_i @ zmu.permute(0, 2, 1), axis=0)
+    b -= L_model @  torch.sum(zxT.permute(0, 2, 1), axis=0)
+    b_hat = W_model @ torch.sum(zzT, axis=0)
+
+    # L2 term penalty
+    obj = torch.pow(torch.linalg.norm(b - b_hat), 2)
+    # L1 term penalty
+    obj += eta * torch.linalg.norm(W_model, 1)
+
+    return obj
+
+
+def _sparse_M_L_obj(W_model: torch.tensor,
+                    L_model: torch.tensor,
+                    zmu: torch.tensor,
+                    xmu: torch.tensor,
+                    y_i: torch.tensor,
+                    xxT: torch.tensor,
+                    zxT: torch.tensor,
+                    eta: float = 1e-3) -> torch.tensor:
+    """Sparse M objective for determining L_t in the next timestep.
+
+    Args:
+        Rmk: All of the below quantities are inferred
+             **per sample**. This means that every matmul
+             is batched using the first dimension. <.> denotes
+             the expectation w.r.t the posterior.
+
+        zxT: torch.tensor. Inferred <zx.T> from E-Step.
+        zzT: torch.tensor. Inferred <zz.T> from E-Step.
+
+             Rmk: Note that this is not necessarily the
+                  covariance of z since z is not 0-mean
+                  w.r.t. the posterior (even though its
+                  marginal distribution is 0-mean). The
+                  same holds w.r.t. the other quantities
+                  we infer that involve inner/outer
+                  products of random vectors.
+
+        xxT: torch.tensor. Inferred <xx.T> from E-Step.
+        zmu: torch.tensor. Inferred <z> from E-Step.
+        xmu: torch.tensor. Inferred <x> from E-Step.
+
+        L_model: torch.tensor (p, k). Current L tensor.
+        W_model: torch.tensor (p, d). Current W tensor.
+
+    Returns:
+        Differentiable regularized loss.
+    """
+ 
+    # make sure batch dimension matches
+    assert zmu.shape[0] == xmu.shape[0]
+    assert zmu.shape[0] == y_i.shape[0]
+    assert zmu.shape[0] == xxT.shape[0]
+
+    # make sure observed dimension matches
+    assert L_model.shape[0] == W_model.shape[0]
+    assert W_model.shape[0] == y_i.shape[1]
+
+    # make sure hidden dimension matches
+    assert W_model.shape[1] == zmu.shape[1]
+    assert L_model.shape[1] == xmu.shape[1]
+ 
+    # we compute a form of generalized lasso
+    # that is, we compute the squared L_2 norm
+    # + a lasso penalty term on W and L, and optimize
+    # this w.r.t. the values in W
+    b = torch.sum(y_i @ xmu.permute(0, 2, 1), axis=0)
+    b -= W_model @  torch.sum(zxT, axis=0)
+    b_hat = L_model @ torch.sum(xxT, axis=0)
+
+    # L2 term penalty
+    obj = torch.pow(torch.linalg.norm(b - b_hat), 2)
+    # L1 term penalty
+    obj += eta * torch.linalg.norm(L_model, 1)
+
+    return obj
+
+ 
+def _sparse_M_step(zxT: torch.tensor,
+                   zzT: torch.tensor,
+                   xxT: torch.tensor,
+                   zmu: torch.tensor,
+                   xmu: torch.tensor,
+                   y_i: torch.tensor,
+                   L_model: torch.tensor,
+                   W_model: torch.tensor,
+                   N: int,
+                   steps: int = 500,
+                   eta: float = 1e-3,
+                   lr: float = 1e-3,
+                   device: str = 'cpu') -> MStepRes:
+    """Method for computing diagonal covariance M-Step with sparsity 
+       in EM algorithm.
+
+    Args:
+        Rmk: All of the below quantities are inferred
+             **per sample**. This means that every matmul
+             is batched using the first dimension. <.> denotes
+             the expectation w.r.t the posterior.
+
+        zxT: torch.tensor. Inferred <zx.T> from E-Step.
+        zzT: torch.tensor. Inferred <zz.T> from E-Step.
+
+             Rmk: Note that this is not necessarily the
+                  covariance of z since z is not 0-mean
+                  w.r.t. the posterior (even though its
+                  marginal distribution is 0-mean). The
+                  same holds w.r.t. the other quantities
+                  we infer that involve inner/outer
+                  products of random vectors.
+
+        xxT: torch.tensor. Inferred <xx.T> from E-Step.
+        zmu: torch.tensor. Inferred <z> from E-Step.
+        xmu: torch.tensor. Inferred <x> from E-Step.
+
+        L_model: torch.tensor (p, k). Current L tensor.
+        W_model: torch.tensor (p, d). Current W tensor.
+
+    Returns:
+        MStepRes instance.
+    """
+    # (n_samples, batch_dim, 1)
+    y_i_batched = y_i[:, :, None].to(device)
+
+    # ensure we maintain gradients
+    W_model.requires_grad = True
+    L_model.requires_grad = True 
+
+    optimizer_W = Adam([W_model], lr=lr)
+    optimizer_L = Adam([L_model], lr=lr)
+
+    """
+        W_model: torch.tensor,
+        L_model: torch.tensor,
+        zmu: torch.tensor,
+        xmu: torch.tensor,
+        y_i: torch.tensor,
+        zzT: torch.tensor,
+        eta: float = 1e-3) -> torch.tensor:
+    """
+
+    print("-------------sparse W lasso objective---------------")
+    # linear regression for W_model
+    for i in range(steps):
+       optimizer_W.zero_grad()
+       loss = _sparse_M_W_obj(W_model,
+                              L_model,
+                              zmu,
+                              xmu,
+                              y_i_batched,
+                              zzT,
+                              zxT,
+                              eta)
+       loss.backward()
+       optimizer_W.step()
+
+       print('{}/{}: {}'.format(i, steps, loss.item()),
+             end='\r',
+             flush=True)
+    print("-------------sparse W lasso objective---------------")
+
+    # TODO: Need to make sure that only the non-zeroed out
+    # entries of L are getting updated with gradients
+    print("--------------sparse L lasso objective-------------------")
+    # linear regression for W_model
+    for i in range(steps):
+       optimizer_L.zero_grad()
+       loss = _sparse_M_L_obj(W_model,
+                              L_model,
+                              zmu,
+                              xmu,
+                              y_i_batched,
+                              xxT,
+                              zxT,
+                              eta)
+       loss.backward()
+       optimizer_L.step()
+       print('{}/{}: {}'.format(i, steps, loss.item()),
+             end='\r',
+             flush=True)
+    print("--------------sparse L lasso objective-------------------")
+
+    # compute the new Phi update
+    new_Phi = (1/N * torch.sum(y_i_batched @ y_i_batched.permute(0, 2, 1) + \
+                                L_model @ xxT @ L_model.T + \
+                                W_model @ zzT @ W_model.T + \
+                                2 * L_model @ zxT.permute(0, 2, 1) @ \
+                               W_model.T + \
+                                -2 * y_i_batched @ zmu.permute(0, 2, 1) @ \
+                               W_model.T + \
+                                -2 * y_i_batched @ xmu.permute(0, 2, 1) @ \
+                               L_model.T, axis=0)).to(device)
+
+    # only update the diagonal components
+    new_Phi = torch.diag(torch.diagonal(new_Phi)).to(device)
+
+    return MStepRes(W_model, L_model, new_Phi)
 
 
 def _M_step(zxT: torch.tensor,
@@ -736,6 +1077,8 @@ def fit_model(y_dims: torch.tensor,
               N: int,
               eps: float = 1e-6,
               steps: int = 5000,
+              toprint: int = 10,
+              method: str = 'stable',
               device: str = 'cpu'):
     """Fit the EM model assuming diagonal noise variance.
     Args:
@@ -746,6 +1089,10 @@ def fit_model(y_dims: torch.tensor,
                   with samples as rows.
         N: Integer. Total number of samples.
         eps: Float. Terminate when ||A_t - A_{t-1}||_F <= eps.
+        toprint: Integer. Print after toprint many steps.
+        method: Boolean. Which method to use. 'stable' for accelerated lstsq,
+                'standard' to allow calls to torch.inverse,
+                'sparse' for LARS-regression step.
         steps: Integer. Max number of EM iterations.
 
     Returns:
@@ -782,32 +1129,48 @@ def fit_model(y_dims: torch.tensor,
 
     # iterate through E/M Steps
     for i in range(steps):
-        # E-Step, then M-Step
+        # initialize variables
+        L_tprime = None
+        W_tprime = None
+        Phi_tprime = None
+        if method == 'standard':
+            # infer missing data from posterior
+            estep = _E_step(W_model,
+                            L_model,
+                            Phi_model,
+                            x_dims,
+                            d,
+                            y_concat_T,
+                            device=device)
 
-        # infer missing data from posterior
-        estep = _E_step(W_model,
-                        L_model,
-                        Phi_model,
-                        x_dims,
-                        d,
-                        y_concat_T,
-                        device=device)
 
-        # maximize likelihood w.r.t. model params
-        mstep = _M_step(estep.zxT,
-                        estep.zzT,
-                        estep.xxT,
-                        estep.zmu,
-                        estep.xmu,
-                        y_concat,
-                        L_model,
-                        W_model,
-                        N,
-                        device=device)
+            # maximize likelihood w.r.t. model params
+            mstep = _M_step(estep.zxT,
+                            estep.zzT,
+                            estep.xxT,
+                            estep.zmu,
+                            estep.xmu,
+                            y_concat,
+                            L_model,
+                            W_model,
+                            N,
+                            device=device)
 
-        L_tprime = mstep.L
-        W_tprime = mstep.W
-        Phi_tprime = mstep.Phi
+            L_tprime = mstep.L
+            W_tprime = mstep.W
+            Phi_tprime = mstep.Phi
+
+        elif method == 'stable':
+            W_tprime, L_tprime, Phi_tprime = _EM_stable(W_model,
+                                                        L_model,
+                                                        Phi_model,
+                                                        x_dims,
+                                                        y_concat,
+                                                        device=device,
+                                                        rcond=1e-08)
+
+        else:
+            raise ValueError('Specified method passed to fit_model() is not \'standard\' or \'stable\'.')
 
         # compute updated L
         L_tupdate = torch.zeros_like(L_tprime).to(device)
@@ -846,7 +1209,7 @@ def fit_model(y_dims: torch.tensor,
             break
 
         # debugging
-        if i % 100 == 0:
+        if i % toprint == 0:
             print("{}/{}: (Wtprime-Wt)_F: {}"
                   " (Ltprime-Lt)_F: {}"
                   " (Phi_tprime-Phi_t)_F: {}".format(i,
