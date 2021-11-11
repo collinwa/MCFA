@@ -108,7 +108,7 @@ def micca_nopc(data_pcs: List[PCARes],
         c_shared = min(dimensions)
 
     if c_private is None:
-        c_private = dimensions - c_shared
+        c_private = [d - c_shared for d in dimensions]
 
     U_splits = [data_pc.U[:, 0:k] for data_pc, k in zip(data_pcs, dimensions)]
     U_all = torch.cat(U_splits, dim=1)
@@ -130,9 +130,11 @@ def micca_nopc(data_pcs: List[PCARes],
     Vp = np.sqrt(n_sets) * vectors[:, c_shared:min(dimensions)]
     Vp_splits = [Vp[i:j, :] for i, j in zip(dimsum[:-1], dimsum[1:])]
     Vp_proj_mats = [_make_pmat(Vps, d) for Vps, d in zip(Vp_splits, u_dims)]
-    # TODO(brielin): had to add 0:k, but not in R version?
+    for dpc, P in zip(data_pcs, Vp_proj_mats):
+        print(((dpc.U * dpc.lam) @ P).var(0).mean())
+        print(((dpc.U * dpc.lam) @ P)[0:10, 0:10])
     C_p_svds = [torch.linalg.svd((dpc.U * dpc.lam) @ P, full_matrices = False)
-                for dpc, P, cp in zip(data_pcs, Vp_proj_mats, c_private)]
+                for dpc, P in zip(data_pcs, Vp_proj_mats)]
     C_private = [C_p_svd.U[:, 0:cp] for C_p_svd, cp in zip(C_p_svds, c_private)]
     lam_private = [C_p_svd.S[0:cp] for C_p_svd, cp in zip(C_p_svds, c_private)]
     return MICCARes(C_all, C_each, rho, C_private, lam_private)
@@ -263,16 +265,10 @@ def posterior_z(Y: torch.Tensor, W: torch.Tensor, Phi: torch.Tensor,
 
 def calc_feature_genvar(W: torch.Tensor):
     # Note: assumes feautures have been PCAd first (does not whiten W).
-    cov_mats = [(W[i:(i+1), :].T @ W[i:(i+1), :]).fill_diagonal_(1) for i in range(W.shape[0])]
-    gen_vars = [torch.linalg.det(cov_mat) for cov_mat in cov_mats]
+    cov_mats = [(W[i:(i+1), :].T @ W[i:(i+1), :]).fill_diagonal_(1)
+                for i in range(W.shape[0])]
+    gen_vars = torch.tensor([torch.linalg.det(cov_mat) for cov_mat in cov_mats])
     return gen_vars, cov_mats
-
-
-# def calc_feature_genvar_z(W: torch.Tensor):
-#     # Note: assumes feautures have been PCAd first (does not whiten W).
-#     cov_mats = [(W[i:(i+1), :].T @ W[i:(i+1), :]).fill_diagonal_(1) for i in range(W.shape[0])]
-#     gen_vars = [torch.linalg.det(cov_mat) for cov_mat in cov_mats]
-#     return gen_vars, cov_mats
 
 
 def loglik(Sigma: torch.Tensor, Sigma_hat: torch.Tensor, n: int) -> float:
@@ -299,12 +295,11 @@ def find_ML_params(
     vectors = torch.flip(vectors, dims=[1])
 
     if d is None: d = min(p)
-    rho = values[0:d] - 1
+    rho = (values[0:d] - 1)/(n_sets - 1)
     vecs = np.sqrt(n_sets) * vectors[:, 0:d]
     p_sum = np.concatenate([[0], np.cumsum(p, 0)])
     vec_splits = [vecs[i:j, :] for i, j in zip(p_sum[:-1], p_sum[1:])]
-    Fs = [((V.T * l) @ vec)/(np.sqrt(n-1))
-          for V, l, vec in zip(Vs, ls, vec_splits)]
+    Fs = [((V.T * l) @ vec) for V, l, vec in zip(Vs, ls, vec_splits)]
     # Equal to diag(rho) @ F.T.
     W_hat = [(F * torch.sqrt(rho)).T for F in Fs]
     Phi_hat = [Sigma_tilde - W.T @ W

@@ -719,10 +719,12 @@ def compute_ISC(datasets: List[torch.tensor]) -> Tuple[torch.tensor,
 
     # compute the b/w set correlation
     for i in range(N_sets):
-        for j in range(i+1, N_sets):
-            rb += torch.sum(torch.mul(datasets[i], datasets[j]), axis=0)
+        # for j in range(i+1, N_sets):
+        for j in range(N_sets):
+            if i != j:
+                rb += torch.sum(torch.mul(datasets[i], datasets[j]), axis=0)
         rw += torch.sum(torch.pow(datasets[i], 2), axis=0)
-    rho = rb / rw
+    rho = rb / (rw * (N_sets - 1))
     return rho, rb, rw
 
 
