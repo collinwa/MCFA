@@ -1,2 +1,2 @@
-# Multi-set Principal Component Correlation Analysis
+# Multi-set Probabilistic Correlation and Factor? Analysis (MPCFA?)
 Stay tuned...
