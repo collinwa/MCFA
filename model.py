@@ -1106,10 +1106,8 @@ def fit_model(y_dims: torch.tensor,
     y_concat_T = y_concat.T.to(device)
 
     # initialize the model parameters
-    W_model, L_model, Phi_model = initialize_model(y_dims,
-                                                   x_dims,
-                                                   datasets,
-                                                   d=d)
+    W_model, L_model, Phi_model = initialize_model(
+        y_dims, x_dims, datasets, d=d)
 
     # move parameters to device
     W_model = W_model.to(device)

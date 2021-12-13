@@ -73,13 +73,11 @@ def pca(X: torch.tensor, k: int = None, center: bool = True,
     return PCARes(pcs, var_exp, vectors, values, k, n, d, mp_dim)
 
 
-def _make_pmat(X: torch.tensor, n: int) -> torch.tensor:
-    nrow_x, _ = X.size()
-    Z = torch.zeros([nrow_x, n - nrow_x])
-    top = torch.cat([X @ X.T, Z ], dim = 1)
-    bot = torch.cat([Z.transpose_(0, 1), torch.eye(n - nrow_x)], dim = 1)
-    P = torch.cat([top, bot], dim = 0)
-    return P
+def _make_P_mats(
+        A_list: List[torch.Tensor]) -> (List[torch.Tensor], List[torch.Tensor]):
+    P_pars = [A @ torch.linalg.lstsq(A.T @ A, A.T)[0] for A in A_list]
+    P_perps = [torch.eye(P.shape[0]) - P for P in P_pars]
+    return P_pars, P_perps
 
 
 # TODO(brielin): fix to match ML_params (.T missing)
@@ -94,23 +92,23 @@ def micca_nopc(data_pcs: List[PCARes],
         dimensions: A list of integers. Dimension for each dataset to use
             if different from the one in the PCARes.
         c_shared: Integer, number of shared components to keep. None for
-            min of  dimensions in data_pcs.
+            sum of  dimensions in data_pcs.
         c_private: List of integers, number of residual private components
             to keep for each dataset.
     """
     n_sets = len(data_pcs)
-    u_dims = [dpc.U.shape[1] for dpc in data_pcs]
 
     if dimensions is None:
         dimensions = [data_pc.k for data_pc in data_pcs]
 
     if c_shared is None:
-        c_shared = min(dimensions)
+        c_shared = sum(dimensions)
 
     if c_private is None:
-        c_private = [d - c_shared for d in dimensions]
+        c_private = [max(d - c_shared, 0) for d in dimensions]
 
     U_splits = [data_pc.U[:, 0:k] for data_pc, k in zip(data_pcs, dimensions)]
+    lam_splits = [data_pc.lam[0:k] for data_pc, k in zip(data_pcs, dimensions)]
     U_all = torch.cat(U_splits, dim=1)
     M = U_all.T @ U_all
     values, vectors = torch.linalg.eigh(M)
@@ -122,21 +120,15 @@ def micca_nopc(data_pcs: List[PCARes],
     V_splits = [V[i:j, :] for i, j in zip(dimsum[:-1], dimsum[1:])]
 
     # Dataset specific shared views.
-    C_each = [U @ V for U, V in zip(U_splits, V_splits)]
+    C_each = [U @ V_split for U, V_split in zip(U_splits, V_splits)]
     # Combined shared view.
     C_all = U_all @ (V * 1/(np.sqrt(1 + rho)))
     # Private views.
-    # TODO(brielin): double check we want min(dimensions)?
-    Vp = np.sqrt(n_sets) * vectors[:, c_shared:min(dimensions)]
-    Vp_splits = [Vp[i:j, :] for i, j in zip(dimsum[:-1], dimsum[1:])]
-    Vp_proj_mats = [_make_pmat(Vps, d) for Vps, d in zip(Vp_splits, u_dims)]
-    for dpc, P in zip(data_pcs, Vp_proj_mats):
-        print(((dpc.U * dpc.lam) @ P).var(0).mean())
-        print(((dpc.U * dpc.lam) @ P)[0:10, 0:10])
-    C_p_svds = [torch.linalg.svd((dpc.U * dpc.lam) @ P, full_matrices = False)
-                for dpc, P in zip(data_pcs, Vp_proj_mats)]
-    C_private = [C_p_svd.U[:, 0:cp] for C_p_svd, cp in zip(C_p_svds, c_private)]
-    lam_private = [C_p_svd.S[0:cp] for C_p_svd, cp in zip(C_p_svds, c_private)]
+    _, P_perps = _make_P_mats(V_splits)
+    weird_mats = [U @ P * l for U, P, l in zip(U_splits, P_perps, lam_splits)]
+    weird_mat_svds = [torch.linalg.svd(wm) for wm in weird_mats]
+    C_private = [wms.U[:, 0:c] for wms, c in zip(weird_mat_svds, c_private)]
+    lam_private = [wms.S[0:c] for wms, c in zip(weird_mat_svds, c_private)]
     return MICCARes(C_all, C_each, rho, C_private, lam_private)
 
 
@@ -151,7 +143,7 @@ def micca(datasets: List[torch.Tensor],
         dimensions: A list of integers. Dimension for each dataset to keep,
             full rank.
         c_shared: Integer, number of shared components to keep. None for
-            min of  dimensions in dimensions.
+            sum of  dimensions in dimensions.
         c_private: List of integers, number of residual private components
             to keep for each dataset.
     """
@@ -263,12 +255,13 @@ def posterior_z(Y: torch.Tensor, W: torch.Tensor, Phi: torch.Tensor,
     return E_z
 
 
-def calc_feature_genvar(W: torch.Tensor):
-    # Note: assumes feautures have been PCAd first (does not whiten W).
+def calc_feature_genvar(W: torch.Tensor, Phi: torch.Tensor):
+    # Note: assumes feautures have been whitened first (does not whiten W).
     cov_mats = [(W[i:(i+1), :].T @ W[i:(i+1), :]).fill_diagonal_(1)
                 for i in range(W.shape[0])]
     gen_vars = torch.tensor([torch.linalg.det(cov_mat) for cov_mat in cov_mats])
-    return gen_vars, cov_mats
+    total_gen_var = torch.linalg.det(W.T @ W + Phi)
+    return gen_vars, total_gen_var
 
 
 def loglik(Sigma: torch.Tensor, Sigma_hat: torch.Tensor, n: int) -> float:
@@ -281,6 +274,7 @@ def loglik(Sigma: torch.Tensor, Sigma_hat: torch.Tensor, n: int) -> float:
 
 def find_ML_params(
         Y: List[torch.Tensor], d = None) -> (torch.Tensor, torch.Tensor):
+    """TODO(brielin): There are no ML params. Repurpose as initiailizer."""
     n_sets = len(Y)
     n = Y[0].size()[0]
     p = [Y_m.size()[1] for Y_m in Y]
