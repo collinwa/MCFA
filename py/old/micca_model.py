@@ -234,6 +234,7 @@ def fit_EM(datasets: List[torch.Tensor], d: int, niter: int = 100,
     if Phi0 is None:
         Phi0 = torch.eye(sum(p))
 
+    track_l = [loglik(Sigma_tilde, W0.T @ W0 + Phi0, n)]
     for i in range(niter):
         if method == "stable":
             W1, Phi1 = EM_step_stable(W0, Phi0, Y, Sigma_tilde, p)
@@ -241,11 +242,13 @@ def fit_EM(datasets: List[torch.Tensor], d: int, niter: int = 100,
             W1, Phi1 = EM_step(W0, Phi0, Sigma_tilde, p)
         delta_W = torch.sum((W1 - W0)**2)
         delta_Phi = torch.sum((Phi1 - Phi0)**2)
+        l = loglik(W1.T @ W1 + Phi1, Sigma_tilde, n)
         if i%print_iter == 0:
-            print(delta_W, delta_Phi, loglik(W0.T @ W0 + Phi0, Sigma_tilde, n), loglik(W1.T @ W1 + Phi1, Sigma_tilde, n))
+            print(delta_W, delta_Phi, loglik(W0.T @ W0 + Phi0, Sigma_tilde, n), l)
         W0 = W1
         Phi0 = Phi1
-    return W0, Phi0
+        track_l = track_l + l
+    return W0, Phi0, track_l
 
 
 def posterior_z(Y: torch.Tensor, W: torch.Tensor, Phi: torch.Tensor,
