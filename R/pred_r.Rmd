@@ -1,0 +1,66 @@
+```{r}
+library(readr)
+library(nnet)
+library(dplyr)
+library(foreach)
+```
+
+```{r}
+fit_multinom <- function(response, features, MaxNWts = 10000, maxit = 1000){
+  model = nnet::multinom(response ~ ., data = features, MaxNWts = MaxNWts, maxit = maxit)
+  null = nnet::multinom(response ~ 1, MaxNWts = MaxNWts, maxit = maxit)
+  mcfadden_pr2 = 1 - model$deviance/null$deviance
+  mcfadden_pr2_adj = 1 - model$AIC/null$AIC
+  model$mcfadden_pr2 = mcfadden_pr2
+  model$mcfadden_pr2_adj = mcfadden_pr2_adj
+  return(model)
+}
+
+get_r2_all <- function(.c, .n, .d){
+  print(c(.n, length(unique(.c))))
+  if( (!is.numeric(.c)) | (length(unique(.c)) < 13) ){
+    kind = "multinom"
+  } else {
+    kind = "linear"
+  }
+  
+  res_tibble <- foreach::foreach(subspace = c("Z", "X_exp", "X_methyl", "X_metab", "X_protein"), .combine = dplyr::bind_rows) %do% {
+    print(c(.n, subspace, kind))
+    if(kind == "multinom"){
+      c_factor = as.factor(.c)
+      model =  fit_multinom(c_factor, select(.d, starts_with(subspace)), MaxNWts = 10000, maxit=1000)
+      r2 = model$mcfadden_pr2
+      r2_adj = model$mcfadden_pr2_adj
+    } else {
+      model = summary(lm(.c ~ ., data = select(.d, starts_with(subspace))))
+      r2 = model$r.squared
+      r2_adj = model$adj.r.squared
+    }
+    return(tibble("Cov" = .n, "Subspace" = subspace, "r2" = r2, "r2_adj" = r2_adj, "kind" = kind))
+  }
+  return(res_tibble)
+}
+```
+
+```{r}
+exam = 1
+parra_factor_save_fn = paste0('/gpfs/commons/projects/MESA/projects/mpcca/para_factors_exam', exam, '.csv')
+pgm_factor_save_fn = paste0('/gpfs/commons/projects/MESA/projects/mpcca/pgm_factors_exam' , exam, '.csv')
+
+meta_df_save_fn = paste0('/gpfs/commons/projects/MESA/projects/mpcca/meta_aligned_exam', exam, '.csv')
+pheno_df_save_fn = paste0('/gpfs/commons/projects/MESA/projects/mpcca/pheno_aligned_exam', exam, '.csv')
+```
+
+```{r}
+parra_df <- read_csv(parra_factor_save_fn)
+pgm_df <- read_csv(pgm_factor_save_fn)
+meta_df <- read_csv(meta_df_save_fn)
+pheno_df <- read_csv(pheno_df_save_fn)
+```
+
+```{r}
+meta_res_parra <- purrr::imap_dfr(select(meta_df, -NWDID), ~ get_r2_all(.x, .y, parra_df))
+meta_res_pgm <- purrr::imap_dfr(select(meta_df, -NWDID), ~ get_r2_all(.x, .y, pgm_df))
+pheno_res_parra <- purrr::imap_dfr(select(pheno_df, -NWDID), ~ get_r2_all(.x, .y, parra_df))
+pheno_res_pgm <- purrr::imap_dfr(select(pheno_df, -NWDID), ~ get_r2_all(.x, .y, pgm_df))
+```
