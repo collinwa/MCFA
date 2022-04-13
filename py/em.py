@@ -1,3 +1,4 @@
+
 # pylint: disable=invalid-name
 """Expectation Maximization routines for MCFA model.
 
@@ -95,6 +96,44 @@ def _EM_step_full_stable(W: torch.tensor, L: torch.tensor, Phi: torch.tensor,
     return W_next, L_next, Phi_next
 
 
+def _get_latent_worker(W: torch.tensor, L: torch.tensor, Phi: torch.tensor,
+                       Y: torch.tensor, device='cpu', rcond: float = 1e-08):
+    if L is not None:
+        S21 = torch.cat([W, L], axis=1).to(device)
+        S22 = W @ W.T + L @ L.T + Phi
+    else:
+        S21 = W
+        S22 = W @ W.T + Phi
+    S22inv_S21 = torch.linalg.lstsq(S22, S21, rcond=rcond).solution
+    E_z_x = Y @ S22inv_S21
+    return E_z_x
+
+
+def calculate_rho(W: List[torch.tensor], L: List[torch.tensor],
+                  Phi: List[torch.tensor], Y: torch.tensor, device: str ='cpu',
+                  rcond: float = 1e-08, method: str = 'genvar'):
+    d = W[1].shape[1]
+    p = [W_m.shape[0] for W_m in W]
+    psum = np.concatenate([[0], np.cumsum(p, 0)])
+    Y = [Y[:, i:j] for i, j in zip(psum[:-1], psum[1:])]
+    if L is not None:
+        E_z_x_all = [_get_latent_worker(W_m, L_m, Phi_m, Y_m, device, rcond)
+                     for W_m, L_m, Phi_m, Y_m in zip(W, L, Phi, Y)]
+    else:
+        E_z_x_all = [_get_latent_worker(W_m, None, Phi_m, Y_m, device, rcond)
+                     for W_m, Phi_m, Y_m in zip(W, Phi, Y)]
+    Z_all = [E_z_x[:, 0:d] for E_z_x in E_z_x_all]
+    S_all = [torch.corrcoef(torch.stack([Z[:, d_m] for Z in Z_all], 1).T) for d_m in range(d)]
+    if method == 'genvar':
+        rho = [-torch.slogdet(S)[1] for S in S_all]
+    elif method == 'sumcor':
+        rho = [S.sum() for S in S_all]
+    elif method == 'ssqcor':
+        rho = [(S**2).sum() for S in S_all]
+    rho = torch.stack(rho)
+    return rho
+
+
 def get_latent(W: List[torch.tensor], L: List[torch.tensor],
                Phi: List[torch.tensor], Y: torch.tensor,
                device='cpu', rcond: float = 1e-08):
@@ -118,14 +157,7 @@ def get_latent(W: List[torch.tensor], L: List[torch.tensor],
     L = None if L is None else torch.block_diag(*L)
     Phi = torch.block_diag(*Phi)
     d = W.shape[1]
-    if L is not None:
-        S21 = torch.cat([W, L], axis=1).to(device)
-        S22 = W @ W.T + L @ L.T + Phi
-    else:
-        S21 = W
-        S22 = W @ W.T + Phi
-    S22inv_S21 = torch.linalg.lstsq(S22, S21, rcond=rcond).solution
-    E_z_x = Y @ S22inv_S21
+    E_z_x = _get_latent_worker(W, L, Phi, Y, device, rcond)
     Z = E_z_x[:, 0:d]
     X = None if L is None else [E_z_x[:, (d+i):(d+j)]
                                 for i, j in zip(ksum[:-1], ksum[1:])]
