@@ -1,4 +1,4 @@
-# Multiset Correlation and Factor Analysis (MPFA)
+# Multiset Correlation and Factor Analysis (MCFA)
 
 MCFA is a method for analysis of multimodal, high-dimensional
 data that combines principals from multiset canonical correlation analysis and
