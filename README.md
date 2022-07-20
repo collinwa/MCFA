@@ -1,6 +1,6 @@
-# Multi-set Probabilistic Correlation and Factor? Analysis (MPCFA?)
+# Multiset Correlation and Factor Analysis (MPFA)
 
-MPCFA (working title) is a method for analysis of multimodal, high-dimensional
+MCFA is a method for analysis of multimodal, high-dimensional
 data that combines principals from multiset canonical correlation analysis and
 factor analysis to jointly model shared and private features across the datasets.
 It was designed with multi-omic analysis in mind, but may be useful for any dataset
@@ -16,16 +16,17 @@ placing the Python source files in the appropriate directory on your machine.
 
 ## Usage instructions and examples
 
-The primary interface to the fitting routines is the function `mpcca.mpcca()` which
-takes a list of Tensors with equal numbers of rows (samples by features) and a set
+The primary interface to the fitting routines is the function `mcfa.mcfa()` which
+takes a list of pandas DataFrames with
+equal numbers of rows (samples by features) and a set
 of analysis options. By default MPCFA learns the relevant hyperparameters from the
 data and thus the default options will suffice for many cases, but see the documentation
-of the function `mpcca.mpcca()` for complete details. For an example of this method
+of the function `mcfa.mcfa()` for complete details. For an example of this method
 applied to the MESA cohort, see the IPython notebook at
-`MPCCA/analysis_notebooks/analyze_mesa.ipynb`.
+`MCFA/analysis_notebooks/analyze_mesa.ipynb`.
 
-Please note that MPCFA does NO preprocessing or data input checking (eg for sample alignment)
-at this time. ALL preprocessing such as normalization, filtering of problematic samples,
+Please note that MCFA does no preprocessing or data input checking (eg for sample alignment)
+at this time. All preprocessing such as normalization, filtering of problematic samples,
 imputation of missing values, and alignment of samples across datasets needs to be done
-prior to calling `mpcca.mpcca()`. For an example of preprocessing steps that were taken
-for the MESA cohort, see `MPCCA/analysis_notebooks/preprocess_mesa.ipynb`
+prior to calling `mcfa.mcfa()`. For an example of preprocessing steps that were taken
+for the MESA cohort, see `MCFA/analysis_notebooks/preprocess_mesa.ipynb`

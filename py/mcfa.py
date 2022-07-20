@@ -8,24 +8,32 @@ Usage:
   TODO(brielin): Add usage example
 """
 
-import concurrent.futures
 import functools
 import numpy as np
 import time
 import torch
 import pandas as pd
+from concurrent import futures
+from torch import multiprocessing
 from dataclasses import dataclass
-from typing import List, Union
+from typing import List, Union, Iterable
 from scipy import stats
+from sklearn import model_selection
 from sklearn import preprocessing
 from MPCCA.py import em
 
 
+# This is required or the pool code below hands on .join().
+# force=True is required or I get an error that the context
+# is already set. I have absolutely no idea why this works.
+# https://pythonspeed.com/articles/python-multiprocessing/
+multiprocessing.set_start_method('spawn', force=True)
+
 @dataclass
 class PCARes:
     """Simple dataclass for storing PCA results."""
-    pcs: torch.Tensor
-    var_exp: torch.Tensor
+    pcs: pd.DataFrame
+    var_exp: pd.Series
     U: torch.Tensor
     S: torch.Tensor
     V: torch.Tensor
@@ -38,19 +46,28 @@ class PCARes:
 @dataclass
 class MCFARes:
     """Simple dataclass for storing MCFA results."""
-    Z: torch.tensor
-    X: List[torch.Tensor]
-    W: List[torch.Tensor]  # Or the concatenation?
-    L: List[torch.Tensor]  # ^
-    Phi: List[torch.Tensor]  # ^
-    lev_W: torch.Tensor
-    lev_L: torch.Tensor
-    rho: torch.Tensor
-    lam: torch.Tensor
-    var_exp_Z: List[torch.Tensor]
-    var_exp_L: List[torch.Tensor]
+    data_pcs: List[PCARes]
+    Z: pd.DataFrame
+    X: List[pd.DataFrame]
+    W: List[pd.DataFrame]
+    L: List[pd.DataFrame]
+    Phi: List[pd.DataFrame]
+    rho: pd.Series
+    lam: List[pd.Series]
+    var_exp_Z: List[pd.Series]
+    var_exp_L: List[pd.Series]
     l: List[float]
     cd: List[float]
+    n_pcs: List[int]
+    d: int
+    k: List[int]
+    center: bool
+    scale: bool
+    init: str
+    maxit: int
+    delta: float
+    device: str
+    rcond: float
 
 
 def pca_transform(X: torch.Tensor, k: int = 'infer', center: bool = True,
@@ -89,7 +106,7 @@ def pca_transform(X: torch.Tensor, k: int = 'infer', center: bool = True,
     return np.sqrt(N) * U
 
 
-def pca(X: torch.tensor, k: int = 'infer', center: bool = True,
+def pca(X: pd.DataFrame, k: int = 'infer', center: bool = True,
         scale: bool = True, calc_V = True) -> PCARes:
     """Basic PCA implementation.
 
@@ -98,7 +115,7 @@ def pca(X: torch.tensor, k: int = 'infer', center: bool = True,
     X.T X / N.
 
     Args:
-        X: Two-dimesional (n x d) torch.tensor.
+        X: n (samples) by d (features) pandas DataFrame.
         k: Integer, 'infer' or 'all'. Number of pcs to keep. Default is to
           infer using the marchenko pasteur cutoff.
         center: bool. True to mean-center columns of X.
@@ -109,9 +126,13 @@ def pca(X: torch.tensor, k: int = 'infer', center: bool = True,
     Returns:
         A PCARes instance.
     """
+    sample_names = X.index
+
     if center | scale:
         X = torch.from_numpy(preprocessing.scale(
             X, with_mean=center, with_std=scale))
+    else:
+        X = torch.from_numpy(X.values)
     N, D = X.shape
     mp_lower_bound = 1 + np.sqrt(D / N)
 
@@ -127,14 +148,18 @@ def pca(X: torch.tensor, k: int = 'infer', center: bool = True,
 
     if D > N:
         U = A[:, 0:k]
-        V = X.T @ U / (S_k * np.sqrt(N)) if calc_V else torch.eye(k, dtype=torch.double)
+        V = torch.eye(k, dtype=torch.double)
+        if calc_V:
+            V = X.T @ U / (S_k * np.sqrt(N))
     else:
         V = A[:, 0:k]
         U = X @ V / (S_k * np.sqrt(N))
         V = V if calc_V else torch.eye(k, dtype=torch.double)
 
-    pcs = U * S_k * np.sqrt(N)
-    var_exp = S_k**2 / torch.sum(S**2)
+    pc_names = ['PC' + str(i+1) for i in range(k)]
+    pcs = pd.DataFrame((U * S_k * np.sqrt(N)).numpy(), index=sample_names,
+                       columns=pc_names)
+    var_exp = pd.Series(S_k**2 / torch.sum(S**2), index=pc_names)
     return PCARes(pcs, var_exp, U, S_k, V, k, N, D, mp_dim)
 
 
@@ -239,7 +264,7 @@ def _rho_mp_sim(N: int, p: List[int], nsims=100, device='cpu'):
     """
     sim_res = []
     for _ in range(nsims):
-        Y = [torch.randn(N, p_m) for p_m in p]
+        Y = [pd.DataFrame(np.random.normal(size=(N, p_m))) for p_m in p]
         Y_pcs = [pca(Y_m, 'all') for Y_m in Y]
         U_all = torch.cat([pc.U for pc in Y_pcs], dim = 1)
         UTU = U_all.T @ U_all
@@ -257,6 +282,32 @@ def load_annot(gmt_file):
             line_split = line.split()
             annot[line_split[0]]  = line_split[2:]
     return annot
+
+
+def gene_score(W: pd.DataFrame, mapping: dict, method: str = 'mean',
+               min_features: int = 5):
+    """Creates gene scores for non-gene-centric data.
+
+    Args:
+      W: Weight matrix (features x factors). Rows will be converted
+        to gene scores via method.
+      mapping: A dictionary mapping gene names to rows of W.
+      method: Approach for gene score calculation. 'mean' or
+        'meansq' for mean of squares.
+      min_features: Minimum number of features to calculate score.
+    """
+    if method not in ['mean', 'meansq']:
+        raise(NotImplementedError)
+    scores = {}
+    for gene, features in mapping.items():
+        avail_features = W.index.intersection(features)
+        if len(avail_features) > min_features:
+            if method == 'mean':
+                score = W.loc[avail_features].mean()
+            elif method == 'meansq':
+                score = (W.loc[avail_features]**2).mean()
+            scores[gene] = score
+    return pd.DataFrame(scores).T
 
 
 def gsea_parametric(W: pd.DataFrame, annot: dict,
@@ -322,13 +373,11 @@ def gsea_parametric(W: pd.DataFrame, annot: dict,
 
 def _calc_gsea_scores(data, Z, transform):
     n = Z.shape[0]
-    # cors = torch.from_numpy(
-    #     preprocessing.scale(data).T) @ torch.from_numpy(preprocessing.scale(Z)) / n
+    # Note: this cannot be done in pytorch because it does not get
+    #  along with concurrent.futures.
     cors = preprocessing.scale(data).T.dot(preprocessing.scale(Z)) / n
     if transform:
-        # cors = np.sqrt(n-3) * torch.atanh(cors)
         cors = np.sqrt(n-3) * np.arctanh(cors)
-    # cors = pd.DataFrame(cors.numpy(), index=data.columns)
     cors = pd.DataFrame(cors, index=data.columns)
     return cors
 
@@ -365,9 +414,10 @@ def gsea_permutation(data: pd.DataFrame, Z: pd.DataFrame,
       enrichment test statistics as entries, the second containing p-values.
     """
     start = time.time()
-    f = functools.partial(_gsea_one_perm, start_time=start, data=data, Z=Z,
-                          transform=transform, annot=annot, min_genes=min_genes, sign=sign)
-    with concurrent.futures.ProcessPoolExecutor(max_workers=threads) as executor:
+    f = functools.partial(
+        _gsea_one_perm, start_time=start, data=data, Z=Z,
+        transform=transform, annot=annot, min_genes=min_genes, sign=sign)
+    with futures.ProcessPoolExecutor(max_workers=threads) as executor:
         all_perm_stats = executor.map(f, range(n_perm))
     perm_stats = np.stack(all_perm_stats)
     print('Finished in {0:f}'.format(time.time()-start))
@@ -384,17 +434,153 @@ def gsea_permutation(data: pd.DataFrame, Z: pd.DataFrame,
     return true_stats, p_vals
 
 
+def _cv_one_iter(
+        indices, Y: Iterable[pd.DataFrame],
+        Z: pd.DataFrame, X: Iterable[pd.DataFrame],
+        n_pcs: Union[str, List[int]] = 'infer',
+        d: Union[str, int] = 'infer', k: Union[str, List[int]] = 'infer',
+        center: bool = True, scale: bool = True, init: str = 'avgvar',
+        maxit: int = 1000, delta: float = 1e-6,
+        device = 'cpu', rcond: float = 1e-8, verbose: bool = True):
+    # TODO(brielin): At the moment, this is assuming that we're doing
+    #   pc-based analysis. Some modification is required if we aren't.
+    (it, (train_idx, test_idx)) = indices
+    n_train = len(train_idx)
+    n_test = len(test_idx)
+    if verbose: print(it, n_train, n_test)
 
-def mcfa(Y: List[torch.Tensor], n_pcs: Union[str, List[int]] = 'infer',
+    if isinstance(Y, dict):
+        ds_names = Y.keys()
+        Y = list(Y.values())
+        X = list(X.values())
+
+    Y_train = [Y_m.iloc[train_idx] for Y_m in Y]
+    Y_test = [Y_m.iloc[test_idx] for Y_m in Y]
+    if center | scale:
+        scalers = [preprocessing.StandardScaler(with_mean=center, with_std=scale)
+                   for _ in Y_train]
+        scalers = [scaler.fit(Y_train_m)
+                   for scaler, Y_train_m in zip(scalers, Y_train)]
+        Y_train = [pd.DataFrame(scaler.transform(Y_tr_m),
+                                index=Y_tr_m.index, columns=Y_tr_m.columns)
+                   for scaler, Y_tr_m in zip(scalers, Y_train)]
+        Y_test = [pd.DataFrame(scaler.transform(Y_te_m),
+                                index=Y_te_m.index, columns=Y_te_m.columns)
+                   for scaler, Y_te_m in zip(scalers, Y_test)]
+
+    cv_res = mcfa(Y_train, n_pcs=n_pcs, d=d, k=k,
+                  center=True, scale=True,
+                  init=init, maxit=maxit,
+                  delta=delta, device=device,
+                  rcond=rcond, result_space = 'pc', verbose=False)
+    Z_tr = torch.from_numpy(cv_res.Z.values)
+    X_tr = [torch.from_numpy(X_m_tr.values) for X_m_tr in cv_res.X]
+
+
+    # The held out data needs to be projected into the PC space learned
+    #   from the training data.
+    # TODO(brielin): does this work with non-informative analysis?
+    Y_test_pcs = [torch.from_numpy(Y_m.values) @ pca_m.V
+                  for Y_m, pca_m in zip(Y_test, cv_res.data_pcs)]
+    W_tens = [torch.from_numpy(W_m.values) for W_m in cv_res.W]
+    L_tens = [torch.from_numpy(L_m.values) for L_m in cv_res.L]
+    Phi_tens = [torch.from_numpy(Phi_m.values) for Phi_m in cv_res.Phi]
+    Z_te, X_te = em.get_latent(W_tens, L_tens, Phi_tens, torch.cat(Y_test_pcs, axis=1),
+                               device, rcond)
+    Y_test_hat = [(Z_te @ W_m.T @ pca_m.V.T + X_m_te @ L_m.T @ pca_m.V.T).numpy()
+                  for X_m_te, L_m, W_m, pca_m in zip(X_te, L_tens, W_tens, cv_res.data_pcs)]
+
+    # Y_train = [torch.from_numpy(pca_m.pcs.values) for pca_m in cv_res.data_pcs]
+    Y_train_pcs = [torch.from_numpy(Y_m.values) @ pca_m.V
+                   for Y_m, pca_m in zip(Y_train, cv_res.data_pcs)]
+    Y_train_hat = [(Z_tr @ W_m.T @ pca_m.V.T + X_m_tr @ L_m.T  @ pca_m.V.T).numpy()
+                   for X_m_tr, L_m, W_m, pca_m in zip(X_tr, L_tens, W_tens, cv_res.data_pcs)]
+
+    nrmse_tr = [np.sqrt(((Y_m - Y_m_hat)**2/Y_m.var(0)).values.mean())
+                for Y_m, Y_m_hat in zip(Y_train, Y_train_hat)]
+    nrmse_te = [np.sqrt(((Y_m - Y_m_hat)**2/Y_m_tr.var(0)).values.mean())
+                for Y_m, Y_m_hat, Y_m_tr in zip(Y_test, Y_test_hat, Y_train)]
+
+    if verbose:
+        print(nrmse_tr, nrmse_te)
+
+    # The CV res Z and X signs might not be aligned with the original.
+    Z_signs = np.sign(np.corrcoef(Z.iloc[train_idx].T, cv_res.Z.T).diagonal(Z.shape[1]))
+    X_signs = [np.sign(np.corrcoef(X_m.iloc[train_idx].T, X_m_cv.T).diagonal(X_m.shape[1]))
+               for X_m, X_m_cv in zip(X, cv_res.X)]
+    Z_te = Z_te * Z_signs
+    X_te = [X_m_te * X_m_signs for X_m_te, X_m_signs in zip(X_te, X_signs)]
+    return Z_te, X_te, nrmse_tr, nrmse_te
+
+
+def mcfa_cv(Y: Iterable[pd.DataFrame], mcfa_res: MCFARes,
+            folds: Union[str, int] = 10, threads: [int] = 1,
+            verbose: bool = True):
+    """Checks for over-fitting using k-fold cross validation.
+
+    Args:
+      Y: Iterable of N (samples) by p_m (features) pandas DataFrames, the
+        M=len(Y) datasets to analyze.
+      mcfa_res: An MCFAres dataclass fit from Y.
+      folds: Integer, number of folds. Or 'loo' for leave-one-out.
+      threads: Integer, number of paralell folds to run.
+    Returns:
+      A tuple Z, X with each entry formed by removing that row, fitting the
+      MCFA model, and projecting that sample's Y into the space fit without
+      it.
+    """
+    if folds == 'loo':
+        folds = mcfa_res.Z.shape[0]
+    elif isinstance(folds, str):
+        raise NotImplementedError
+
+    cv_iter = model_selection.KFold(n_splits=folds)
+    results = []
+    X_hat = []
+    Z_hat = []
+    nrmse_tr = []
+    nrmse_te = []
+    if threads > 0:
+        with multiprocessing.get_context('spawn').Pool(threads) as pool:
+            for indices in enumerate(cv_iter.split(mcfa_res.Z)):
+                results.append(pool.apply_async(_cv_one_iter, (
+                    indices, Y, mcfa_res.Z, mcfa_res.X, mcfa_res.n_pcs,
+                    mcfa_res.d, mcfa_res.k, mcfa_res.center,
+                    mcfa_res.scale, mcfa_res.init, mcfa_res.maxit, mcfa_res.delta,
+                    mcfa_res.device, mcfa_res.rcond, verbose)))
+            pool.close()
+            pool.join()
+    else:
+        for indices in enumerate(cv_iter.split(mcfa_res.Z)):
+            results.append(_cv_one_iter(
+                indices, Y, mcfa_res.Z, mcfa_res.X, mcfa_res.n_pcs,
+                mcfa_res.d, mcfa_res.k, mcfa_res.center,
+                mcfa_res.scale, mcfa_res.init, mcfa_res.maxit, mcfa_res.delta,
+                mcfa_res.device, mcfa_res.rcond, verbose))
+
+    for res in results:
+        Z_res, X_res, nrmse_tr_res, nrmse_te_res = res.get() if threads > 0 else res
+        X_hat.append(X_res)
+        Z_hat.append(Z_res)
+        nrmse_tr.append(nrmse_tr_res)
+        nrmse_te.append(nrmse_te_res)
+    # TODO(brielin): add indices and column labels to X and Z.
+    X_hat = [np.concatenate(X_m, 0) for X_m in map(list, zip(*X_hat))]
+    Z_hat = np.concatenate(Z_hat, 0)
+    return Z_hat, X_hat, np.array(nrmse_tr), np.array(nrmse_te)
+
+
+def mcfa(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
          d: Union[str, int] = 'infer', k: Union[str, List[int]] = 'infer',
          center: bool = True, scale: bool = True, init: str = 'avgvar',
-         calc_leverages: bool = True, maxit: int = 1000, delta: float = 1e-6,
+         result_space: str = 'full', maxit: int = 1000, delta: float = 1e-6,
          device = 'cpu', rcond: float = 1e-8, verbose: bool = True):
     """Interface function to the MCFA estimators.
 
     Args:
-        Y: List of N (samples) by p_m (features) torch tensors, the
-          M=len(Y) datasets to analyze.
+        Y: Iterable of N (samples) by p_m (features) pandas DataFrames, the
+          M=len(Y) datasets to analyze. If a dictionary, keys will be used
+          as names in the results.
         center: Bool. True to mean-center columns of Y.
         scale: Bool. True to variance-scale columns of Y to 1.0.
         n_pcs: 'infer', 'all' or a list of length M of integers. The number
@@ -416,11 +602,12 @@ def mcfa(Y: List[torch.Tensor], n_pcs: Union[str, List[int]] = 'infer',
           that if n_pcs is not 'all', the model is fit explicitly to the PCs
           of each dataset and therefore the 'avgvar' and 'avgnorm'
           initializations are equivalent.
-        calc_leverages: bool or list of bools, one per dataset. True to
-          propagate inference back to the original data space, rather than
-          remaining in PC space. Setting this to False for particularly
-          wide datasets that you aren't interested in the individual features
-          loadings for can save substantial memory.
+        result_space: Either 'full' or 'pc' (for informative analyses only).
+          If 'full', weight matrices (W, L) will be transformed back to
+          the observed space (gene features). If 'pc', weight matrices will
+          remain in pc space (pc features). Note that noise matrices (phi)
+          are left untransformed because the full pxp noise matrix can be
+          enormous.
         maxit: Maximum number of iterations of the pgm to run. Set to 0
           to run none and return only the initial solution.
         delta: Float, convergance tolerance for EM.
@@ -449,10 +636,25 @@ def mcfa(Y: List[torch.Tensor], n_pcs: Union[str, List[int]] = 'infer',
         raise NotImplementedError(
             'Implemented initializers are avgnorm, avgvar, and random.')
 
-    N = Y[0].shape[0]
-    if any(Y_m.shape[0] != N for Y_m in Y):
-        raise ValueError(
-            'Input data matrices must have an equal number of samples (rows).')
+    if isinstance(result_space, str) & (result_space not in ['pc', 'full']):
+        raise NotImplementedError(
+            'n_pcs must be "infer", "all" or a list of integers.')
+
+
+    ds_names = None
+    if isinstance(Y, dict):
+        ds_names = Y.keys()
+        Y = list(Y.values())
+    sample_names = [Y_m.index for Y_m in Y]
+    feature_names = [Y_m.columns for Y_m in Y]
+    common_samples = sample_names[0]
+    for names in sample_names[1:]:
+        common_samples = common_samples.intersection(names)
+    N = len(common_samples)
+    if any(Y_m.shape[0] > N for Y_m in Y):
+        print('WARNING: there are {0:d} samples in common across the datasets.'
+              ' Data will be filtered to just these samples'.format(N))
+        Y = [Y_m.loc[common_samples] for Y_m in Y]
 
     if isinstance(n_pcs, List):
         if len(n_pcs) != len(Y):
@@ -475,28 +677,30 @@ def mcfa(Y: List[torch.Tensor], n_pcs: Union[str, List[int]] = 'infer',
     elif n_pcs == 'infer':
         n_pcs = ['infer']*M
 
-    if calc_leverages is True:
-        calc_leverages = [True]*M
-    elif calc_leverages is False:
-        calc_leverages = [False]*M
-
     if verbose: print('Calculating data PCs.')
 
-    Y_pcs = [pca(Y_m, n_pc_m, center, scale, lev_m)
-             for Y_m, n_pc_m, lev_m in zip(Y, n_pcs, calc_leverages)]
+    Y_pcs = [pca(Y_m, n_pc_m, center, scale)
+             for Y_m, n_pc_m in zip(Y, n_pcs)]
+    if informative and result_space == 'pc':
+        feature_names = [['pc_' + str(k+1) for k in range(Y_pc.k)]
+                         for Y_pc in Y_pcs]
 
     if informative:
         p = [pc.k for pc in Y_pcs]
-        Y_all = torch.cat([pc.pcs for pc in Y_pcs], axis=1)
+        n_pcs = p
+        Y_all = torch.cat([torch.from_numpy(pc.pcs.values)
+                           for pc in Y_pcs], axis=1)
     else:
         p = [Y_m.shape[1] for Y_m in Y]
+        n_pcs = None
         if center | scale:
             Y_all = torch.cat(
                 [torch.from_numpy(preprocessing.scale(
                     Y_m, with_mean=center, with_std=scale)) for Y_m in Y],
                 axis = 1)
         else:
-            Y_all = torch.cat(Y, axis=1)
+            Y_all = torch.cat([torch.from_numpy(Y_m.values) for Y_m in Y],
+                              axis=1)
     if verbose: print('Calculating exmpirical covariance.')
     Sigma_hat = Y_all.T @ Y_all / N
     psum = np.concatenate([[0], np.cumsum(p, 0)])
@@ -504,9 +708,10 @@ def mcfa(Y: List[torch.Tensor], n_pcs: Union[str, List[int]] = 'infer',
 
     # TODO(brielin): This is doing a little extra work/memory if d == 'infer'
     #   and init = 'avgvar' (the default). Also note that _init_ methods may
-    #   no longer neeed to return rho and ppca may no longer need to return vals.
+    #   no longer need to return rho and ppca may no longer need to return vals.
     if verbose: print('Initialzing model.')
-    if d == 'all': d = p_all
+    if d == 'all':
+        d = p_all
     elif d == 'infer':
         if verbose: print('Inferring the shared dimensionality.')
         rho_min, _ = _rho_mp_sim(N, p)
@@ -523,8 +728,7 @@ def mcfa(Y: List[torch.Tensor], n_pcs: Union[str, List[int]] = 'infer',
     elif init == 'avgnorm':
         W0, _ = _init_norm_W(Sigma_hat, psum, d, M)
     elif init == 'avgvar':
-        W0, rho0  = _init_var_W(Y_pcs, psum, d, informative)
-        print(rho0)
+        W0, _  = _init_var_W(Y_pcs, psum, d, informative)
 
     if k == 'infer':
         k = [pca_m.mp_dim - d for pca_m in Y_pcs]
@@ -536,7 +740,6 @@ def mcfa(Y: List[torch.Tensor], n_pcs: Union[str, List[int]] = 'infer',
     else:
         L0, Phi0 = _init_L_Phi(Sigma_hat, W0, psum, p, k)
 
-    # TODO(brielin): consider reordering from initial order.
     if verbose: print('Fitting the model.')
     W, L, Phi, l, cd = em.fit_EM_iter(
         Y_all, Sigma_hat, W0, L0, Phi0, maxit, device, rcond, delta, verbose)
@@ -546,23 +749,47 @@ def mcfa(Y: List[torch.Tensor], n_pcs: Union[str, List[int]] = 'infer',
     W = [W_m[:, order] for W_m in W]
     Z, X = em.get_latent(W, L, Phi, Y_all, device, rcond)
 
-    if verbose: print('Calculating feature importance and leverage scores.')
-    if informative:
+    if verbose: print('Calculating feature importance.')
+    if informative and (result_space == 'full'):
         W = [pc_m.V @ W_m for W_m, pc_m in zip(W, Y_pcs)]
         L = None if L is None else [pc_m.V @ L_m for L_m, pc_m in zip(L, Y_pcs)]
-        Phi = [pc_m.V @ Phi_m @ pc_m.V.T for Phi_m, pc_m in zip(Phi, Y_pcs)]
 
-    lev_W = [(W_m**2).sum(1) for W_m in W]
-    lev_L = None if L is None else [(L_m**2).sum(1) for L_m in L]
+    Z_names = ['Z' + str(i+1) for i in range(d)]
+    if ds_names is not None:
+        X_names = [['X' + str(i+1) + '_' + name for i in range(k_m)]
+                   for name, k_m in zip(ds_names, k)]
+    else:
+        X_names = [['X' + str(i+1) + '_' + str(m+1) for i in range(k_m)]
+                   for m, k_m in enumerate(k)]
+    Z = pd.DataFrame(Z.numpy(), index=common_samples, columns=Z_names)
+    X = [pd.DataFrame(X_m.numpy(), index=common_samples, columns=names)
+         for X_m, names in zip(X, X_names)]
+    W = [pd.DataFrame(W_m.numpy(), index=names, columns=Z_names)
+         for W_m, names in zip(W, feature_names)]
+    rho = pd.Series(rho, index=Z_names)
+    Phi = [pd.DataFrame(phi.numpy()) for phi in Phi]
 
-    W2_sum = [(W_m**2).sum(0) for W_m in W]
-    L2_sum = None if L is None else [(L_m**2).sum(0) for L_m in L]
-    var_exp_Z = [sum_m/Y_m.shape[1] if scale else sum_m/sum(torch.var(Y_m, 0))
-                 for sum_m, Y_m in zip(W2_sum, Y)]
+    if scale:
+        var_exp_Z = [(W_m**2).sum(0)/W_m.shape[0] for W_m in W]
+    else:
+        var_exp_Z = [(W_m**2).sum(0)/sum(Y_m.var(0))
+                     for W_m, Y_m in zip(W, Y)]
+    var_exp_Z = pd.concat(var_exp_Z, axis=1)
+
     var_exp_L = None
+    lam = None
     if L is not None:
-        var_exp_L = [sum_m/Y_m.shape[1] if scale else sum_m/sum(torch.var(Y_m, 0))
-                     for sum_m, Y_m in zip(L2_sum, Y)]
-    lam = None if L is None else [(L_m**2).sum(0) for L_m in L]
+        L = [pd.DataFrame(L_m.numpy(), index=ind_names, columns=col_names)
+             for L_m, ind_names, col_names in zip(L, feature_names, X_names)]
+        lam = [(L_m**2).sum(0) for L_m in L]
+        if scale:
+            var_exp_L = [l/L_m.shape[0] for l, L_m in zip(lam, L)]
+        else:
+            var_exp_L = [l/sum(Y_m.var(0)) for l, Y_m in zip(lam, Y)]
 
-    return MCFARes(Z, X, W, L, Phi, lev_W, lev_L, rho, lam, var_exp_Z, var_exp_L, l, cd)
+    if ds_names is not None:
+        X = {name: X_m for name, X_m in zip(ds_names, X)}
+        Y_pcs = {name: Y_m for name, Y_m in zip(ds_names, Y_pcs)}
+    return MCFARes(Y_pcs, Z, X, W, L, Phi, rho, lam, var_exp_Z, var_exp_L, l,
+                   cd, n_pcs, d, k, center, scale, init, maxit, delta,
+                   device, rcond)

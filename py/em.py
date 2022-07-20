@@ -1,4 +1,3 @@
-
 # pylint: disable=invalid-name
 """Expectation Maximization routines for MCFA model.
 
@@ -123,7 +122,8 @@ def calculate_rho(W: List[torch.tensor], L: List[torch.tensor],
         E_z_x_all = [_get_latent_worker(W_m, None, Phi_m, Y_m, device, rcond)
                      for W_m, Phi_m, Y_m in zip(W, Phi, Y)]
     Z_all = [E_z_x[:, 0:d] for E_z_x in E_z_x_all]
-    S_all = [torch.corrcoef(torch.stack([Z[:, d_m] for Z in Z_all], 1).T) for d_m in range(d)]
+    S_all = [torch.corrcoef(torch.stack([Z[:, d_m] for Z in Z_all], 1).T)
+             for d_m in range(d)]
     if method == 'genvar':
         rho = [-torch.slogdet(S)[1] for S in S_all]
     elif method == 'sumcor':
@@ -147,7 +147,8 @@ def get_latent(W: List[torch.tensor], L: List[torch.tensor],
        device: 'cpu' or 'gpu'.
        rcond: Condition number for least squares.
     Returns:
-       Tuple of tensors: N x d (posterior Z), N x k_all (posterior X). 
+       Tuple of (tensor, List[tensor]): N x d (posterior Z),
+         list of N x k_m (posterior X).
     """
     # TODO(brielin): Figure out a way to do this calculation efficiently
     #   without cat/block_diag on W, L, Phi
