@@ -12,6 +12,7 @@ import functools
 import numpy as np
 import time
 import torch
+import pdb
 import pandas as pd
 from concurrent import futures
 from torch import multiprocessing
@@ -21,7 +22,7 @@ from scipy import stats
 from sklearn import model_selection
 from sklearn import preprocessing
 from MPCCA.py import em
-
+from torch.distributions.multivariate_normal import MultivariateNormal
 
 # This is required or the pool code below hands on .join().
 # force=True is required or I get an error that the context
@@ -70,8 +71,55 @@ class MCFARes:
     rcond: float
 
 
+def _sparse_mp_sim(X: torch.Tensor, S: torch.Tensor, quantile=0.75, nsims=50,
+    device='cpu', sparsity_thresh: float = 0.95, debug=True, use_cov=True):
+    """ Does a sparse simulation for selecting the number of PCs to include
+    in dataset X.
+    Arguments:
+        X: torch.tensor. A N x p matrix containing centered + scaled data.
+        S: torch.tensor. Pre-computed eigenvalues using the gram matrix.
+        quantile: Float. Quantile of eigenvalue to estimate to determine
+          eigenvalue threshold.
+        nsims: Integer. Number of simulations to run.
+        sparsity_thresh: Float. Proportion of entries to zero-out in the sparse
+          simulation.
+        use_cov: Boolean. Whether to use the gene-gene covariance matrix in
+          the MP simulation.
+    Returns:
+        An integer denoting the number of PCs to keep in the data.
+    """
+    if debug:
+        print(f"Simulation settings: (quantile, {quantile}), (nsims, {nsims})"\
+        f"(sparsity_thresh, {sparsity_thresh})")
+    eps = 1e-4
+    N, p_m = X.shape
+    cov_mat = X.cov() if use_cov else torch.eye(N)
+    normal_dist = MultivariateNormal(torch.zeros(N), cov_mat + eps * \
+        torch.eye(N).float())
+    all_max_eigenvalues = []
+
+    for i in range(nsims):
+        if debug:
+            print(f"On MP sparse simulation {i}")
+        sim_mat = normal_dist.sample((p_m,)).T
+        sim_mat *= torch.bernoulli((1-sparsity_thresh) * torch.ones(N, p_m))
+        sim_mat -= torch.mean(sim_mat, axis=0, keepdim=True)
+        sim_mat /= torch.std(sim_mat, axis=0, keepdim=True)
+        cov = sim_mat.T @ sim_mat / N
+        cur_lambda = torch.quantile(torch.linalg.eigvalsh(cov), quantile, dim=0)
+        all_max_eigenvalues.append(np.sqrt(cur_lambda))
+
+    all_max_eigenvalues = torch.tensor(all_max_eigenvalues)
+    dim =  sum(S > all_max_eigenvalues.mean())
+    if debug:
+        print(f"{S.max()}, {all_max_eigenvalues.mean() - all_max_eigenvalues.std()}")
+        print(f"{dim} PCs Inferred using Sparse Simulation")
+    return dim
+
+
 def pca_transform(X: torch.Tensor, k: int = 'infer', center: bool = True,
-        scale: bool = True):
+        scale: bool = True, quantile=0.75, nsims=50, sparsity_thresh=0.75,
+        use_cov=True):
     """Transforms data to k-dimensional space with identity covariance.
 
     Use this if you have a wide (p > N) matrix and you only need whitened
@@ -80,10 +128,18 @@ def pca_transform(X: torch.Tensor, k: int = 'infer', center: bool = True,
 
     Args:
         X: Two-dimesional (N x p) torch.tensor.
-        k: Integer or 'infer'. Number of pcs to keep. Default is to
-          infer using the marchenko pasteur cutoff.
+        k: Integer or 'infer' or 'sparse'. Number of pcs to keep. Default is to
+          infer using the marchenko pasteur cutoff. 'sparse' uses a sparse MP
+          simulation.
         center: bool. True to mean-center columns of X.
         scale: bool. True to variance-scale the columns of X to 1.0.
+        quantile: Float. Ignored if k != 'sparse'. Quantile of eigenvalue
+          to estimate.
+        nsims: Integer.  Ignored if k != 'sparse'. Number of simulations to run.
+        sparsity_thresh: Float. Ignored if k != 'sparse'. Proportion of
+          entries to zero-out in sparse simulation.
+        use_cov: Boolean. Ignored if k != 'sparse'. Whether to use the
+          gene-gene covariance structure when generating data.
     Returns:
         An N by k matrix with X.T @ X / N = I_k.
     """
@@ -101,13 +157,19 @@ def pca_transform(X: torch.Tensor, k: int = 'infer', center: bool = True,
     A = torch.flip(vecs, dims=[1])
     mp_dim = sum(S > mp_lower_bound)
 
-    if k == 'infer': k = mp_dim
+    if k == 'infer':
+        k = mp_dim
+    elif k == 'sparse':
+        k = _sparse_mp_sim(X, S, quantile=quantile, nsims=nsims,
+            sparsity_thresh=sparsity_thresh, use_cov=use_cov)
+
     U = A[:, 0:k]
     return np.sqrt(N) * U
 
 
 def pca(X: pd.DataFrame, k: int = 'infer', center: bool = True,
-        scale: bool = True, calc_V = True) -> PCARes:
+        scale: bool = True, calc_V = True, quantile=0.75, nsims=50,
+        sparsity_thresh=0.75, use_cov=True) -> PCARes:
     """Basic PCA implementation.
 
     This is a basic PCA implementation which is particularly efficient for
@@ -116,13 +178,21 @@ def pca(X: pd.DataFrame, k: int = 'infer', center: bool = True,
 
     Args:
         X: n (samples) by d (features) pandas DataFrame.
-        k: Integer, 'infer' or 'all'. Number of pcs to keep. Default is to
-          infer using the marchenko pasteur cutoff.
+        k: Integer, 'infer' or 'all' or 'sparse'. Number of pcs to keep. Default
+          is to infer using the marchenko pasteur cutoff. 'sparse' uses a
+          simulation of sparse noise to select the PC dimension.
         center: bool. True to mean-center columns of X.
         scale: bool. True to variance-scale the columns of X to 1.0.
         calc_V: True to track the PC loadings (right singular vectors)
           of X. Setting to False can save substantial memory if X is very
           wide.
+        quantile: Float. Ignored if k != 'sparse'. Quantile of eigenvalue
+          to estimate.
+        nsims: Integer.  Ignored if k != 'sparse'. Number of simulations to run.
+        sparsity_thresh: Float. Ignored if k != 'sparse'. Proportion of
+          entries to zero-out in sparse simulation.
+        use_cov: Boolean. Ignored if k != 'sparse'. Whether to use the
+          gene-gene covariance structure when generating data.
     Returns:
         A PCARes instance.
     """
@@ -142,8 +212,15 @@ def pca(X: pd.DataFrame, k: int = 'infer', center: bool = True,
     A = torch.flip(vecs, dims=[1])
     mp_dim = sum(S > mp_lower_bound)
 
-    if k in ('infer', 'all'):
-        k = mp_dim if k == 'infer' else min(N, D)
+    if k in ('infer', 'all', 'sparse'):
+        if k == 'infer':
+            k = mp_dim
+        elif k == 'all':
+            k = min(N, D)
+        else:
+            k = _sparse_mp_sim(X, S, quantile=quantile, nsims=nsims,
+            sparsity_thresh=sparsity_thresh, use_cov=use_cov)
+
     S_k = S[0:k]
 
     if D > N:
@@ -253,7 +330,60 @@ def _orthogonalize(X):
     return U*S
 
 
-def _rho_mp_sim(N: int, p: List[int], nsims=100, device='cpu'):
+def _sparse_rho_mp_sim(N: int, p: List[int], quantile: float = 0.90,
+    nsims: int = 50, sparsity_thresh: float = 0.80, debug: bool = True,
+    device: str ='cpu'):
+    """ Does a simulation to infer the shared dimensionality of the data.
+    Simulates sparse white noise, centers + standardizes, then runs the
+    Parra solution, returning either the maximum or a quantile based
+    eigenvalue. Note that this is for data where the samples are *genes*.
+    Therefore, when we do our simulation, we sample p_m feature vectors of
+    dimension N (rather than N feature vectors of dimension p_m).
+
+    Arguments:
+        N: Integer. Number of samples.
+        p: List[Integer]. Dimensionality of the feature space.
+        quantile: Float. Quantile of eigenvalue to estimate.
+        nsims: Integer. Number of simulations to do.
+        sparsity_thresh: Float. Proportion of entries in the data to zero-out
+            when doing the simulation.
+    Returns:
+        Estimated quantile eigenvalue and sample variance.
+    """
+    noise_distributions = []
+
+    if debug:
+        print("Inferring sparse shared dimensionality")
+
+    sim_res = []
+    for i in range(nsims):
+        Y = []
+        if debug:
+            print(f"On simulation {i}.")
+
+        for k, p_m in enumerate(p):
+            sim_mat = torch.randn(N, p_m)
+            sim_mat *= torch.bernoulli((1-sparsity_thresh) * torch.ones(N, p_m))
+            sim_mat -= torch.mean(sim_mat, axis=0, keepdim=True)
+            sim_mat /= torch.std(sim_mat, axis=0, keepdim=True)
+            sim_df = pd.DataFrame(sim_mat.numpy())
+            assert sim_df.shape[0] == N and sim_df.shape[1] == p_m
+            Y.append(sim_df)
+        if debug:
+            print("Calculating Parra Solution")
+        # calculate the Parra CCA solution, picking a quantile
+        Y_pcs = [pca(Y_m, 'all') for Y_m in Y]
+        U_all = torch.cat([pc.U for pc in Y_pcs], dim = 1)
+        UTU = U_all.T @ U_all
+        rho = torch.linalg.eigvalsh(UTU)
+        sim_res.append(torch.quantile(rho, quantile, dim=0))
+
+    sim_res = torch.Tensor(sim_res)
+    return sim_res.mean(), np.sqrt(sim_res.var()/nsims)
+
+
+def _rho_mp_sim(N: int, p: List[int], quantile=0.90, nsims=50, device='cpu',
+                sparse=True, sparsity_thresh=0.95, debug=True):
     """Calculates the MCCA (Parra) solution to random data.
 
     Args:
@@ -261,7 +391,14 @@ def _rho_mp_sim(N: int, p: List[int], nsims=100, device='cpu'):
       p: List of integers. Dimensions of the datasets to simulate.
       nsims: Number of simulation iterations.
       device: Device to run on.
+      sparse: Boolean. Whether to use the sparse simulation method or not.
+      sparsity_thresh: Float. Number of entries to zero-out in the sparse
+        simulation. Ignored if sparse=False.
     """
+    if sparse:
+        return _sparse_rho_mp_sim(N, p, quantile=quantile, nsims=nsims,
+            sparsity_thresh=sparsity_thresh, device=device, debug=debug)
+
     sim_res = []
     for _ in range(nsims):
         Y = [pd.DataFrame(np.random.normal(size=(N, p_m))) for p_m in p]
@@ -269,7 +406,7 @@ def _rho_mp_sim(N: int, p: List[int], nsims=100, device='cpu'):
         U_all = torch.cat([pc.U for pc in Y_pcs], dim = 1)
         UTU = U_all.T @ U_all
         rho = torch.linalg.eigvalsh(UTU)
-        sim_res.append(torch.max(rho))
+        sim_res.append(torch.quantile(rho, quantile, dim=0))
     sim_res = torch.Tensor(sim_res)
     return sim_res.mean(), np.sqrt(sim_res.var()/nsims)
 
@@ -573,24 +710,27 @@ def mcfa_cv(Y: Iterable[pd.DataFrame], mcfa_res: MCFARes,
 def mcfa(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
          d: Union[str, int] = 'infer', k: Union[str, List[int]] = 'infer',
          center: bool = True, scale: bool = True, init: str = 'avgvar',
-         result_space: str = 'full', maxit: int = 1000, delta: float = 1e-6,
+         result_space: str = 'full', sparsity_d: float = 0.95,
+         quantile_d: float = 0.90, sparsity_pc: float=0.95, 
+         quantile_pc: float = 0.90, maxit: int = 1000, delta: float = 1e-6,
          device = 'cpu', rcond: float = 1e-8, verbose: bool = True):
     """Interface function to the MCFA estimators.
-
     Args:
         Y: Iterable of N (samples) by p_m (features) pandas DataFrames, the
           M=len(Y) datasets to analyze. If a dictionary, keys will be used
           as names in the results.
         center: Bool. True to mean-center columns of Y.
         scale: Bool. True to variance-scale columns of Y to 1.0.
-        n_pcs: 'infer', 'all' or a list of length M of integers. The number
-          of PCs of each dataset to keep. 'all' does not whiten/PCA data
-          prior to modeling, 'infer' uses the Marchenko-Pasteur
-          cutoff to choose PCs. A list of integers
-          specifies the number of PCs to keep from each dataset.
-        d: 'infer', 'all' or integer. Dimensionality of the hidden space.
-          If 'infer' a simulation will be done to determine the number
-          of correlated components to keep.
+        n_pcs: 'infer', 'all', 'sparse', or a list of length M of integers.
+          The number of PCs of each dataset to keep. 'all' does not whiten/PCA
+          data prior to modeling, 'infer' uses the Marchenko-Pasteur
+          cutoff to choose PCs, 'sparse' uses a sparse simulation to choose PCs,
+          a list of integers specifies the number of PCs to keep from each
+          dataset.
+        d: 'infer', 'all', 'sparse', or integer. Dimensionality of the hidden
+          space. If 'infer' a simulation will be done to determine the number
+          of correlated components to keep. If 'sparse', a sparse simulation
+          will be done to determine the number of correlated components to keep.
         k: 'infer', None, or list of integers. Number of private components
           to model per dataset. If 'infer', k is set to n_pcs - d. If None,
           no private components will be modeled.
@@ -608,6 +748,16 @@ def mcfa(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
           remain in pc space (pc features). Note that noise matrices (phi)
           are left untransformed because the full pxp noise matrix can be
           enormous.
+        sparsity_d: Float. If d is set to 'sparse', then this is the sparsity
+          of the simulation that is done. This parameter is ignored when
+          d != 'sparse'.
+        sparsity_pc: Float. If n_pcs is set to 'sparse', then this is the
+          sparsity of the simulation that is done. This parameter is ignored
+          when d != 'sparse'.
+        quantile_d: Float. Quantile of the eigenvalues to use when estimating
+          the rho cutoff when inferring the number of CCs.
+        quantile_pc: Float. Quantile of the eigenvalues to use when estimating
+          the eigenvalue cutoff for inferring the number of PCs.
         maxit: Maximum number of iterations of the pgm to run. Set to 0
           to run none and return only the initial solution.
         delta: Float, convergance tolerance for EM.
@@ -620,13 +770,13 @@ def mcfa(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
         ValueError: if the input data matrices have a different number
           of rows.
     """
-    if isinstance(n_pcs, str) & (n_pcs not in ['infer', 'all']):
+    if isinstance(n_pcs, str) & (n_pcs not in ['infer', 'all', 'sparse']):
         raise NotImplementedError(
-            'n_pcs must be "infer", "all" or a list of integers.')
+            'n_pcs must be "infer", "all", "sparse", or a list of integers.')
 
-    if isinstance(d, str) & (d not in ['infer', 'all']):
+    if isinstance(d, str) & (d not in ['infer', 'all', 'sparse']):
         raise NotImplementedError(
-            'd must be "infer", "all" or an integer.')
+            'd must be "infer", "all", "sparse", or an integer.')
 
     if isinstance(k, str) & (k not in ['infer', 'all']):
         raise NotImplementedError(
@@ -662,7 +812,7 @@ def mcfa(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
                 'Length of PC list does not match number of datasets.')
 
     if isinstance(k, List):
-        if len(n_pcs) != len(Y):
+        if len(k) != len(Y):
             raise ValueError(
                 'Length of private list does not match number of datasets.')
 
@@ -676,11 +826,14 @@ def mcfa(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
         n_pcs = ['all']*M
     elif n_pcs == 'infer':
         n_pcs = ['infer']*M
+    elif n_pcs == 'sparse':
+        n_pcs = ['sparse']*M
 
     if verbose: print('Calculating data PCs.')
 
-    Y_pcs = [pca(Y_m, n_pc_m, center, scale)
-             for Y_m, n_pc_m in zip(Y, n_pcs)]
+    Y_pcs = [pca(Y_m, n_pc_m, center, scale, sparsity_thresh=sparsity_pc,
+            quantile=quantile_pc, nsims=10, use_cov=True)
+            for Y_m, n_pc_m in zip(Y, n_pcs)]
     if informative and result_space == 'pc':
         feature_names = [['pc_' + str(k+1) for k in range(Y_pc.k)]
                          for Y_pc in Y_pcs]
@@ -709,12 +862,16 @@ def mcfa(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
     # TODO(brielin): This is doing a little extra work/memory if d == 'infer'
     #   and init = 'avgvar' (the default). Also note that _init_ methods may
     #   no longer need to return rho and ppca may no longer need to return vals.
-    if verbose: print('Initialzing model.')
+    if verbose: print('Initializing model.')
     if d == 'all':
         d = p_all
-    elif d == 'infer':
-        if verbose: print('Inferring the shared dimensionality.')
-        rho_min, _ = _rho_mp_sim(N, p)
+    elif d == 'infer' or d == 'sparse':
+        use_sparse = (d == 'sparse')
+        if verbose: print('Inferring the shared dimensionality. Simulation' \
+        f' params: (use_sparse, {use_sparse}), (quantile, {quantile_d})' \
+        f' (sparsity, {sparsity_d})')
+        rho_min, _ = _rho_mp_sim(N, p, quantile=quantile_d, nsims=10,
+            sparse=use_sparse, sparsity_thresh=sparsity_d, debug=verbose)
         U_all = torch.cat([pc.U for pc in Y_pcs], dim = 1)
         UTU = U_all.T @ U_all
         rho0 = torch.linalg.eigvalsh(UTU)
