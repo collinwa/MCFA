@@ -99,8 +99,6 @@ def _sparse_mp_sim(X: torch.Tensor, S: torch.Tensor, quantile=0.75, nsims=50,
     all_max_eigenvalues = []
 
     for i in range(nsims):
-        if debug:
-            print(f"On MP sparse simulation {i}")
         sim_mat = normal_dist.sample((p_m,)).T
         sim_mat *= torch.bernoulli((1-sparsity_thresh) * torch.ones(N, p_m))
         sim_mat -= torch.mean(sim_mat, axis=0, keepdim=True)
@@ -819,7 +817,7 @@ def mcfa(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
     # TODO(brielin): this needs to be a list if n_pcs is allowed to have
     #   individual entries be 'all' so only some datasets are processed
     #   with informative PCs.
-    informative = (n_pcs == 'infer')  | isinstance(n_pcs, List)
+    informative = (n_pcs in ['infer', 'sparse'])  | isinstance(n_pcs, List)
 
     M = len(Y)
     if n_pcs == 'all':
@@ -870,12 +868,12 @@ def mcfa(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
         if verbose: print('Inferring the shared dimensionality. Simulation' \
         f' params: (use_sparse, {use_sparse}), (quantile, {quantile_d})' \
         f' (sparsity, {sparsity_d})')
-        rho_min, _ = _rho_mp_sim(N, p, quantile=quantile_d, nsims=10,
+        rho_min, _ = _rho_mp_sim(N, p, quantile=quantile_d, nsims=5,
             sparse=use_sparse, sparsity_thresh=sparsity_d, debug=verbose)
         U_all = torch.cat([pc.U for pc in Y_pcs], dim = 1)
         UTU = U_all.T @ U_all
         rho0 = torch.linalg.eigvalsh(UTU)
-        d = sum(rho0 > rho_min)
+        d = min(sum(rho0 > rho_min).item(), min(p))
         if verbose:
             print(('There are {} components above rho' +
                    ' inclusion threshold {}.').format(d, rho_min))
@@ -888,7 +886,7 @@ def mcfa(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
         W0, _  = _init_var_W(Y_pcs, psum, d, informative)
 
     if k == 'infer':
-        k = [pca_m.mp_dim - d for pca_m in Y_pcs]
+        k = [pca_m.k - d for pca_m in Y_pcs]
 
     if init == 'random':
         L0 = None if k is None else [
