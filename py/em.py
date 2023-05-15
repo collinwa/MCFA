@@ -4,6 +4,7 @@
 Do not call directly, see mcfa.py for usage.
 """
 
+import time
 import torch
 import numpy as np
 from typing import List
@@ -206,7 +207,8 @@ def fit_EM_iter(Y, Sigma_hat, W, L, Phi, maxit = 1000, device = 'cpu',
     cd = [torch.mean((Sigma - Sigma_hat)**2/denom).tolist()]
 
     L_it = None
-    if verbose: print(0, l[0], cd[0])
+    t0 = time.time()
+    if verbose: print('iter:', 0, 'Likelihood:', l[0])
     for it in range(maxit):
         if L is None:
             W_it, Phi_it = _EM_step_no_private_stable(
@@ -225,7 +227,7 @@ def fit_EM_iter(Y, Sigma_hat, W, L, Phi, maxit = 1000, device = 'cpu',
         W = W_it
         L = L_it
         Phi = Phi_it
-        if verbose: print(it+1, l_it, cd_it, l_delta_it, cd_delta_it)
+        if verbose: print('Iter:', it+1, 'Likelihood:', l_it, 'Percent change:', l_delta_it, 'Time (s):', time.time()-t0)
         if delta is not None:
             if l_delta_it < delta: break
     W = [W[i:j, :] for i, j in zip(psum[:-1], psum[1:])]
