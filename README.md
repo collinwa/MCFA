@@ -158,7 +158,7 @@ Please note that MCFA does no preprocessing or data input checking (eg for sampl
 other than optional feature centering and scaling at this time.
 All additional preprocessing such as normalization, filtering of problematic samples,
 imputation of missing values, and alignment of samples across datasets needs to be done
-prior to calling `mcfa.mcfa()`. For an example of preprocessing steps that were taken
+prior to calling `mcfa_model.fit()`. For an example of preprocessing steps that were taken
 for the MESA cohort, see `MCFA/analysis_notebooks/preprocess_mesa.ipynb`
 
 This software is under active development. Please report any issues
