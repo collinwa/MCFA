@@ -20,7 +20,7 @@ These include `torch`, `numpy`, `pandas`, `scipy`, and `sklearn`.
 
 ## Usage instructions and examples
 ### Basic model fitting
-The primary interface to the fitting routines is the function `mcfa.mcfa()` which
+The primary interface to the fitting routines is the function `mcfa_model.fit()` which
 takes a list of pandas DataFrames with equal numbers of rows (samples by features) and a set
 of analysis options. By default MPCFA learns the relevant hyperparameters from the
 data and thus the default options will suffice for many cases.
@@ -56,17 +56,18 @@ If you don't need to do analysis of the factor loadings matrix, you can set the 
 space. This can save some time and memory if you have very large hidden dimensionalities and
 feature spaces for your input matrices.
 
-`mcfa_model.fit()` results an `MCFARes` object that can be used in downstream analysis.
-`mcfa_res.Z` contains a `samples x d pd.DataFrame` with the location of the points in
-the shared space, `mcfa_res.X` contains an iterable of `samples x k_i pd.DataFrame`
-with the corresponding private spaces, `W` is likewise an iterable of shared space
+`mcfa_model.fit()` returns an `MCFARes` object that can be used in downstream analysis.
+`mcfa_res.Z` contains a `samples x d` `pd.DataFrame` with the location of the points in
+the shared space, `mcfa_res.X` contains an iterable of `samples x k_i` `pd.DataFrame`'s
+with the corresponding private spaces. `W` is likewise an iterable of shared space
 factor loadings dataframes `d x p_i`, and `L` is an iterable of private space
 factor loadings matrices `k_i x p_i`. `var_exp_Z` and `var_exp_X` contain the
 variance in each dataset explained by the shared and private spaces, respectively.
 
 
 See the dosctring of the function `mcfa_model.fit()` for complete details, and
-`analysis_notebooks/analyze_mesa.ipynb` for more downstream analysis examples.
+`analysis_notebooks/analyze_mesa.ipynb` to see how we used the functionality of
+this package in our analysis of the MESA/TOPMed multi-omic pilot data.
 
 ### Cross Validation
 Once you have fit your model, you may consider doing cross-validation to assure that you
@@ -78,9 +79,9 @@ Z_cv, X_cv, nrmse_tr, nrmse_te = mcfa_model.cv(Y, mcfa_res, folds = 'loo')
 
 `Z_cv` and `X_cv` will contain a `pd.DataFrame` and iterable of such where each sample
 in the DataFrame corresponds to the location of that sample in the respective space
-in the model fit /without/ that sample included. The `nrmse_tr` and `nrmse_te` contain
-normalized root mean square error for each sample in each dataset. The `folds` argument
-specifies the number of folds, or use `'loo'` for leave-one-out cross-validation.
+in the model fit *without* that sample included. The `nrmse_tr` and `nrmse_te` contain
+normalized root mean square error for each fold in each dataset. The `folds` argument
+specifies the number of folds, or use `folds='loo'` for leave-one-out cross-validation.
 
 Keep in mind that proper choice of the hidden dimensionality is directly related to the
 sample size - with fewer samples, you have to model fewer hidden dimensions. Thus, if
@@ -91,12 +92,26 @@ with less.
 
 ### Feature set enrichment analysis
 Generally speaking, we recommend analying variance-normalized feature loadings matrices
+or Z-transformed correlations of dataset features with the hidden space of interest
 to find highly-weighted features in downstream analysis. This is generally less-prone
 to mis-specification than "set"-type enrichment analyses. The primary reason
 for this is that the feature loadings matrix is correlated, and dealing with this
-correlation is not straightforward. However, we do provide functionality for
+correlation is not straightforward.
+
+You can use the function `mcfa_model.score` to calculate correlations between data features
+inferred dimensions
+
+```
+cor1 = mcfa_model.score(Y['Y_1'], mcfa_res.Z, transfrom = True
+```
+
+This returns a `features x factors` `pd.DataFrame` with entries the corelation between
+the feature and factor. With `transform = True` these will use Fisher's Z-transformation
+to turn these into roughly normally-distributed Z-scores.
+
+However, we do also provide functionality for
 gene set enrichment analysis using the `gsea.parametric` and `gsea.permutation`
-functions. These functions implement the proposed approach in Frost et al. /BioDataMining/
+functions. These functions implement the proposed approach in Frost et al. *BioDataMining*
 2015.
 
 The simplest and most problematic approach is parametric -
@@ -109,21 +124,21 @@ This will compute a score and p-value for each annotation in `annot` against eac
 in the factor loadings matrix for dataset `Y_1`. Here, `annot` is a dictionary mapping
 annotation names to feature names. You can use the function `gsea.load_annot()` to load
 a GMT annotation file into the proper format. `ref_sample` gives a reference sample for
-correcting for the correlation present in the factor loadings matrix. `None` will
+correcting for the correlation present in the factor loadings matrix. `ref_sample = None` will
 perform no correction, and will likely result in many false positives. On the other hand,
 you could use in-sample correction `ref_sample = Y['Y_1']`, which will likely result
 in very low power. An independent reference panel may provide better correction.
 If you have one, you can also specify that here.
 
-The other primary approach is to do permutations -
+The other approach is to do permutations -
 ```
-scores, pvals = gsea.permutation(Y['Y_1'], mcfa_res.Z, annot, n_perm=10000, threads=10)
+scores, pvals = gsea.permutation(Y['Y_1'], mcfa_res.Z, annot, n_perm=100000, threads=10)
 ```
 
 This looks for (transformed) correlations of the input data (`Y['Y_1']`) with the
 reduced space (`mcfa_res.Z`) and uses permutations to correct for the correlations
 across features. This generally works quite well, with the trouble being that you
-need to do a /lot/ of permutations. For a standard gene set enrichment analysis, you
+need to do a *lot* of permutations. For a standard gene set enrichment analysis, you
 likely need to do at least 100k permutations to get somewhat accurate p-value estimates.
 If you have multiple cores available, you can speed things up with the `threads` argument.
 
@@ -149,5 +164,5 @@ for the MESA cohort, see `MCFA/analysis_notebooks/preprocess_mesa.ipynb`
 This software is under active development. Please report any issues
 encountered using the issues tab. For the exact code used in the manuscript
 "Multiset correlation and factor analysis enables exploration of multi-omic data",
-Brown, Wang et al /Cell Genomics/ forthcoming, see the tagged first release. An archive
+Brown, Wang et al *Cell Genomics* forthcoming, see the tagged first release. An archive
 of that repository is also available on Zenodo - https://doi.org/10.5281/zenodo.7951370.
