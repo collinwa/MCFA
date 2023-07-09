@@ -8,19 +8,15 @@ Usage:
   TODO(brielin): Add usage example
 """
 
-import functools
 import numpy as np
-import time
-import torch
 import pandas as pd
-from concurrent import futures
+import torch
 from torch import multiprocessing
 from dataclasses import dataclass
 from typing import List, Union, Iterable
-from scipy import stats
 from sklearn import model_selection
 from sklearn import preprocessing
-from MPCCA.py import em
+from multicor_fa import _em
 
 
 # This is required or the pool code below hands on .join().
@@ -48,14 +44,14 @@ class MCFARes:
     """Simple dataclass for storing MCFA results."""
     data_pcs: List[PCARes]
     Z: pd.DataFrame
-    X: List[pd.DataFrame]
-    W: List[pd.DataFrame]
-    L: List[pd.DataFrame]
-    Phi: List[pd.DataFrame]
+    X: Iterable[pd.DataFrame]
+    W: Iterable[pd.DataFrame]
+    L: Iterable[pd.DataFrame]
+    Phi: Iterable[pd.DataFrame]
     rho: pd.Series
-    lam: List[pd.Series]
-    var_exp_Z: List[pd.Series]
-    var_exp_L: List[pd.Series]
+    lam: Iterable[pd.Series]
+    var_exp_Z: Iterable[pd.Series]
+    var_exp_X: Iterable[pd.Series]
     l: List[float]
     cd: List[float]
     n_pcs: List[int]
@@ -273,105 +269,17 @@ def _rho_mp_sim(N: int, p: List[int], nsims=100, device='cpu'):
     sim_res = torch.Tensor(sim_res)
     return sim_res.mean(), np.sqrt(sim_res.var()/nsims)
 
-
-def load_annot(gmt_file):
-    """Loads a GMT annotation file into a dict mapping annot to gene list."""
-    annot = {}
-    with open(gmt_file) as f:
-        for line in f:
-            line_split = line.split()
-            annot[line_split[0]]  = line_split[2:]
-    return annot
-
-
-def gene_score(W: pd.DataFrame, mapping: dict, method: str = 'mean',
-               min_features: int = 5):
-    """Creates gene scores for non-gene-centric data.
+def score(data, Z, transform = True):
+    """Calculates (transformed) correlations between model factors and data.
 
     Args:
-      W: Weight matrix (features x factors). Rows will be converted
-        to gene scores via method.
-      mapping: A dictionary mapping gene names to rows of W.
-      method: Approach for gene score calculation. 'mean' or
-        'meansq' for mean of squares.
-      min_features: Minimum number of features to calculate score.
-    """
-    if method not in ['mean', 'meansq']:
-        raise(NotImplementedError)
-    scores = {}
-    for gene, features in mapping.items():
-        avail_features = W.index.intersection(features)
-        if len(avail_features) > min_features:
-            if method == 'mean':
-                score = W.loc[avail_features].mean()
-            elif method == 'meansq':
-                score = (W.loc[avail_features]**2).mean()
-            scores[gene] = score
-    return pd.DataFrame(scores).T
-
-
-def gsea_parametric(W: pd.DataFrame, annot: dict,
-                    ref_sample: pd.DataFrame = None, sign = True,
-                    min_genes = 5, shrink = 0):
-    """Performs gene set enrichment analysis (GSEA).
-
-    Peforms GSEA using the parametric PCGSE approach of Frost 2015 BDM.
-
-    Args:
-      W: A p (features) by k (factors) DataFrame with index corresponding
-        to the values in annot.
-      annot: A dictionary of gene set annotations mapping annotation
-        names to a list of gene ids.
-      ref_sample: An N (samples) by p (features) DataFrame with reference
-        samples to use as feature correlations
-      sign: True to consider the sign of W, otherwise compute test statistics
-        using abs(W).
-      min_genes: The minimum number of genes in an annotation to include.
+      data: A pandas DataFrame with features as columns. The original data.
+      Z: The factor set used to calculate gene statistics. Usually mcfa_res.Z.
+      transform: bool. True to transform correlations to Z-scores.
     Returns:
-      A tuple of len(annot) x k DataFrames, the first containing the
-      enrichment test statistics as entries, the second containing p-values.
+      A pd.DataFrame with rows as data features and columns as factors, entires
+      are (optionally Z-transformed) correlations.
     """
-    p = W.shape[0]
-    sigma_p = np.sqrt(W.var())
-    score_df = {}
-    pv_df = {}
-    for category, gene_set in annot.items():
-        if ref_sample is not None:
-            genes_in_set = ref_sample.columns.intersection(gene_set)
-            genes_not_in_set = ref_sample.columns.difference(gene_set)
-            m_k = len(genes_in_set)
-            if m_k < min_genes:
-                continue
-            rho_k = (np.triu(ref_sample[genes_in_set].corr()*(1-shrink), k=1).sum()) / m_k
-            df = len(ref_sample.index) - 2
-        else:
-            genes_in_set = W.index.intersection(gene_set)
-            genes_not_in_set = W.index.difference(gene_set)
-            m_k = len(genes_in_set)
-            if m_k < min_genes:
-                continue
-            rho_k = 0
-            df = p - 2
-        VIF = 1 + rho_k
-        if sign:
-            in_set_mean = W.loc[genes_in_set].mean()
-            out_set_mean = W.loc[genes_not_in_set].mean()
-        else:
-            in_set_mean = abs(W).loc[genes_in_set].mean()
-            out_set_mean = abs(W).loc[genes_not_in_set].mean()
-        num = (in_set_mean - out_set_mean)
-        denom = (sigma_p * np.sqrt( VIF / m_k + 1 / (p - m_k)))
-
-        Z_k = num/denom
-        score_df[category] = Z_k
-        if sign:
-            pv_df[category] = 2 * (1 - stats.t.cdf(abs(Z_k), df=df))
-        else:
-            pv_df[category] = 1 - stats.t.cdf(Z_k, df=df)
-    return pd.DataFrame(score_df).T, pd.DataFrame(pv_df).T
-
-
-def _calc_gsea_scores(data, Z, transform):
     n = Z.shape[0]
     # Note: this cannot be done in pytorch because it does not get
     #  along with concurrent.futures.
@@ -382,58 +290,6 @@ def _calc_gsea_scores(data, Z, transform):
     return cors
 
 
-def _gsea_one_perm(it, start_time, data, Z, transform, annot, min_genes, sign):
-    if it%100 == 0:
-        print('Permutation {0:d}. Time {1:.2f}s'.format(it, time.time()-start_time))
-    perm_data = data.sample(frac=1)
-    perm_scores = _calc_gsea_scores(perm_data, Z, transform)
-    perm_stats = gsea_parametric(
-        W=perm_scores, annot=annot, ref_sample=None,
-        sign=sign, min_genes=min_genes, shrink=0)[0].values
-    return perm_stats
-
-
-def gsea_permutation(data: pd.DataFrame, Z: pd.DataFrame,
-                     annot: dict, n_perm = 1000, sign = True, min_genes = 5,
-                     transform = True, threads = 1):
-    """Performs GSEA using the permutation approach of Frost 2015.
-
-    Args:
-      data: A pandas DataFrame with column names matching entires in annot.
-        The original data.
-      Z: The feature set used to calculate gene statistics. Usually mcfa_res.Z.
-      annot: A dictionary of gene set annotations mapping annotation
-        names to a list of gene ids.
-      n_perm: Number of permutations.
-      sign: True to consider the sign of W, otherwise compute test statistics
-        using abs(W).
-      min_genes: The minimum number of genes in an annotation to include.
-      transform: bool, true to transform correlation coefficients to Z-scores.
-    Returns:
-      A tuple of len(annot) x k DataFrames, the first containing the
-      enrichment test statistics as entries, the second containing p-values.
-    """
-    start = time.time()
-    f = functools.partial(
-        _gsea_one_perm, start_time=start, data=data, Z=Z,
-        transform=transform, annot=annot, min_genes=min_genes, sign=sign)
-    with futures.ProcessPoolExecutor(max_workers=threads) as executor:
-        all_perm_stats = executor.map(f, range(n_perm))
-    perm_stats = np.stack(all_perm_stats)
-    print('Finished in {0:f}'.format(time.time()-start))
-    true_scores = _calc_gsea_scores(data, Z, transform)
-    true_stats, _ = gsea_parametric(W=true_scores, annot=annot, ref_sample=None,
-                                 sign=sign, min_genes=min_genes, shrink=0)
-    print(perm_stats.shape)
-    print(true_stats.shape)
-    if sign:
-        p_vals = 1 - np.sum(true_stats.values**2 > perm_stats**2, 0) / n_perm
-    else:
-        p_vals = 1 - np.sum(true_stats.values > perm_stats, 0) / n_perm
-    p_vals = pd.DataFrame(p_vals, index=true_stats.index)
-    return true_stats, p_vals
-
-
 def _cv_one_iter(
         indices, Y: Iterable[pd.DataFrame],
         Z: pd.DataFrame, X: Iterable[pd.DataFrame],
@@ -441,7 +297,7 @@ def _cv_one_iter(
         d: Union[str, int] = 'infer', k: Union[str, List[int]] = 'infer',
         center: bool = True, scale: bool = True, init: str = 'avgvar',
         maxit: int = 1000, delta: float = 1e-6,
-        device = 'cpu', rcond: float = 1e-8, verbose: bool = True):
+        device = 'cpu', rcond: float = 1e-8, verbose: bool = False):
     # TODO(brielin): At the moment, this is assuming that we're doing
     #   pc-based analysis. Some modification is required if we aren't.
     (it, (train_idx, test_idx)) = indices
@@ -468,11 +324,11 @@ def _cv_one_iter(
                                 index=Y_te_m.index, columns=Y_te_m.columns)
                    for scaler, Y_te_m in zip(scalers, Y_test)]
 
-    cv_res = mcfa(Y_train, n_pcs=n_pcs, d=d, k=k,
-                  center=True, scale=True,
-                  init=init, maxit=maxit,
-                  delta=delta, device=device,
-                  rcond=rcond, result_space = 'pc', verbose=False)
+    cv_res = fit(Y_train, n_pcs=n_pcs, d=d, k=k,
+                 center=True, scale=True,
+                 init=init, maxit=maxit,
+                 delta=delta, device=device,
+                 rcond=rcond, result_space = 'pc', verbose=verbose)
     Z_tr = torch.from_numpy(cv_res.Z.values)
     X_tr = [torch.from_numpy(X_m_tr.values) for X_m_tr in cv_res.X]
 
@@ -485,7 +341,7 @@ def _cv_one_iter(
     W_tens = [torch.from_numpy(W_m.values) for W_m in cv_res.W]
     L_tens = [torch.from_numpy(L_m.values) for L_m in cv_res.L]
     Phi_tens = [torch.from_numpy(Phi_m.values) for Phi_m in cv_res.Phi]
-    Z_te, X_te = em.get_latent(W_tens, L_tens, Phi_tens, torch.cat(Y_test_pcs, axis=1),
+    Z_te, X_te = _em.get_latent(W_tens, L_tens, Phi_tens, torch.cat(Y_test_pcs, axis=1),
                                device, rcond)
     Y_test_hat = [(Z_te @ W_m.T @ pca_m.V.T + X_m_te @ L_m.T @ pca_m.V.T).numpy()
                   for X_m_te, L_m, W_m, pca_m in zip(X_te, L_tens, W_tens, cv_res.data_pcs)]
@@ -513,9 +369,10 @@ def _cv_one_iter(
     return Z_te, X_te, nrmse_tr, nrmse_te
 
 
-def mcfa_cv(Y: Iterable[pd.DataFrame], mcfa_res: MCFARes,
-            folds: Union[str, int] = 10, threads: [int] = 1,
-            verbose: bool = True):
+
+def cv(Y: Iterable[pd.DataFrame], mcfa_res: MCFARes,
+       folds: Union[str, int] = 10, threads: [int] = 1,
+       verbose: bool = False):
     """Checks for over-fitting using k-fold cross validation.
 
     Args:
@@ -541,15 +398,16 @@ def mcfa_cv(Y: Iterable[pd.DataFrame], mcfa_res: MCFARes,
     nrmse_tr = []
     nrmse_te = []
     if threads > 0:
-        with multiprocessing.get_context('spawn').Pool(threads) as pool:
-            for indices in enumerate(cv_iter.split(mcfa_res.Z)):
-                results.append(pool.apply_async(_cv_one_iter, (
-                    indices, Y, mcfa_res.Z, mcfa_res.X, mcfa_res.n_pcs,
-                    mcfa_res.d, mcfa_res.k, mcfa_res.center,
-                    mcfa_res.scale, mcfa_res.init, mcfa_res.maxit, mcfa_res.delta,
-                    mcfa_res.device, mcfa_res.rcond, verbose)))
-            pool.close()
-            pool.join()
+        raise NotImplementedError
+        # with multiprocessing.get_context('spawn').Pool(threads) as pool:
+        #     for indices in enumerate(cv_iter.split(mcfa_res.Z)):
+        #         results.append(pool.apply_async(_cv_one_iter, (
+        #             indices, Y, mcfa_res.Z, mcfa_res.X, mcfa_res.n_pcs,
+        #             mcfa_res.d, mcfa_res.k, mcfa_res.center,
+        #             mcfa_res.scale, mcfa_res.init, mcfa_res.maxit, mcfa_res.delta,
+        #             mcfa_res.device, mcfa_res.rcond, verbose)))
+        #     pool.close()
+        #     pool.join()
     else:
         for indices in enumerate(cv_iter.split(mcfa_res.Z)):
             results.append(_cv_one_iter(
@@ -564,17 +422,42 @@ def mcfa_cv(Y: Iterable[pd.DataFrame], mcfa_res: MCFARes,
         Z_hat.append(Z_res)
         nrmse_tr.append(nrmse_tr_res)
         nrmse_te.append(nrmse_te_res)
-    # TODO(brielin): add indices and column labels to X and Z.
+
     X_hat = [np.concatenate(X_m, 0) for X_m in map(list, zip(*X_hat))]
     Z_hat = np.concatenate(Z_hat, 0)
-    return Z_hat, X_hat, np.array(nrmse_tr), np.array(nrmse_te)
+
+    ds_names = None
+    if isinstance(Y, dict):
+        ds_names = Y.keys()
+
+    Z_names = ['Z' + str(i+1) for i in range(mcfa_res.d)]
+    if ds_names is not None:
+        X_names = [['X' + str(i+1) + '_' + name for i in range(k_m)]
+                   for name, k_m in zip(ds_names, mcfa_res.k)]
+    else:
+        X_names = [['X' + str(i+1) + '_' + str(m+1) for i in range(k_m)]
+                   for m, k_m in enumerate(mcfa_res.k)]
+    Z_hat = pd.DataFrame(Z_hat, index=mcfa_res.Z.index, columns=Z_names)
+    X_hat = [pd.DataFrame(X_m, index=mcfa_res.Z.index, columns=names)
+         for X_m, names in zip(X_hat, X_names)]
+    nrmse_tr = pd.DataFrame(
+        np.array(nrmse_tr), index=['fold_' + str(i) for i in range(folds)])
+    nrmse_te = pd.DataFrame(
+        np.array(nrmse_te), index=['fold_' + str(i) for i in range(folds)])
+
+    if ds_names is not None:
+        X_hat = dict(zip(ds_names, X_hat))
+        nrmse_tr.columns = ds_names
+        nrmse_te.columns = ds_names
+
+    return Z_hat, X_hat, nrmse_tr, nrmse_te
 
 
-def mcfa(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
-         d: Union[str, int] = 'infer', k: Union[str, List[int]] = 'infer',
-         center: bool = True, scale: bool = True, init: str = 'avgvar',
-         result_space: str = 'full', maxit: int = 1000, delta: float = 1e-6,
-         device = 'cpu', rcond: float = 1e-8, verbose: bool = True):
+def fit(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
+        d: Union[str, int] = 'infer', k: Union[str, List[int]] = 'infer',
+        center: bool = True, scale: bool = True, init: str = 'avgvar',
+        result_space: str = 'full', maxit: int = 1000, delta: float = 1e-6,
+        device = 'cpu', rcond: float = 1e-8, verbose: bool = True):
     """Interface function to the MCFA estimators.
 
     Args:
@@ -741,13 +624,13 @@ def mcfa(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
         L0, Phi0 = _init_L_Phi(Sigma_hat, W0, psum, p, k)
 
     if verbose: print('Fitting the model.')
-    W, L, Phi, l, cd = em.fit_EM_iter(
+    W, L, Phi, l, cd = _em.fit_EM_iter(
         Y_all, Sigma_hat, W0, L0, Phi0, maxit, device, rcond, delta, verbose)
-    rho = em.calculate_rho(W, L, Phi, Y_all, device, rcond, 'genvar')
+    rho = _em.calculate_rho(W, L, Phi, Y_all, device, rcond, 'genvar')
     rho, order = torch.sort(rho, descending=True)
 
     W = [W_m[:, order] for W_m in W]
-    Z, X = em.get_latent(W, L, Phi, Y_all, device, rcond)
+    Z, X = _em.get_latent(W, L, Phi, Y_all, device, rcond)
 
     if verbose: print('Calculating feature importance.')
     if informative and (result_space == 'full'):
@@ -776,20 +659,27 @@ def mcfa(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
                      for W_m, Y_m in zip(W, Y)]
     var_exp_Z = pd.concat(var_exp_Z, axis=1)
 
-    var_exp_L = None
+    var_exp_X = None
     lam = None
     if L is not None:
         L = [pd.DataFrame(L_m.numpy(), index=ind_names, columns=col_names)
              for L_m, ind_names, col_names in zip(L, feature_names, X_names)]
         lam = [(L_m**2).sum(0) for L_m in L]
         if scale:
-            var_exp_L = [l/L_m.shape[0] for l, L_m in zip(lam, L)]
+            var_exp_X = [l/L_m.shape[0] for l, L_m in zip(lam, L)]
         else:
-            var_exp_L = [l/sum(Y_m.var(0)) for l, Y_m in zip(lam, Y)]
+            var_exp_X = [l/sum(Y_m.var(0)) for l, Y_m in zip(lam, Y)]
 
     if ds_names is not None:
-        X = {name: X_m for name, X_m in zip(ds_names, X)}
-        Y_pcs = {name: Y_m for name, Y_m in zip(ds_names, Y_pcs)}
-    return MCFARes(Y_pcs, Z, X, W, L, Phi, rho, lam, var_exp_Z, var_exp_L, l,
+        X = dict(zip(ds_names, X))
+        Y_pcs = dict(zip(ds_names, Y_pcs))
+        W = dict(zip(ds_names, W))
+        L = dict(zip(ds_names, L))
+        Phi = dict(zip(ds_names, Phi))
+        lam = dict(zip(ds_names, lam))
+        var_exp_Z.columns = ds_names
+        var_exp_X = dict(zip(ds_names, var_exp_X))
+
+    return MCFARes(Y_pcs, Z, X, W, L, Phi, rho, lam, var_exp_Z, var_exp_X, l,
                    cd, n_pcs, d, k, center, scale, init, maxit, delta,
                    device, rcond)
