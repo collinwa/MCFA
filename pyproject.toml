@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "multicor_fa"
-version = "1.0.1"
+version = "1.0.2"
 authors = [
   { name="Brielin C. Brown", email="bbrown@nygenome.org" },
   { name="Collin Wang", email="cwang@nygenome.org"},

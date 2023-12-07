@@ -138,6 +138,7 @@ def pca(X: pd.DataFrame, k: int = 'infer', center: bool = True,
     A = torch.flip(vecs, dims=[1])
     mp_dim = sum(S > mp_lower_bound)
 
+    # TODO(brielin): Throw error if infer and not center/scale.
     if k in ('infer', 'all'):
         k = mp_dim if k == 'infer' else min(N, D)
     S_k = S[0:k]
@@ -174,6 +175,7 @@ def _ppca(X, d):
     return W, s2, vals
 
 
+# TODO(brielin): Double check that
 def _init_var_W(Y_pcs, psum, d, informative):
     """Initializes W using sumcor with avgvar constraint.
 
@@ -452,7 +454,8 @@ def cv(Y: Iterable[pd.DataFrame], mcfa_res: MCFARes,
 
     return Z_hat, X_hat, nrmse_tr, nrmse_te
 
-
+# TODO(brielin): set delta=NULL to just use maxit.
+# TODO(brielin): EM is broken if you don't center.
 def fit(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
         d: Union[str, int] = 'infer', k: Union[str, List[int]] = 'infer',
         center: bool = True, scale: bool = True, init: str = 'avgvar',
@@ -545,7 +548,7 @@ def fit(Y: Iterable[pd.DataFrame], n_pcs: Union[str, List[int]] = 'infer',
                 'Length of PC list does not match number of datasets.')
 
     if isinstance(k, List):
-        if len(n_pcs) != len(Y):
+        if len(k) != len(Y):
             raise ValueError(
                 'Length of private list does not match number of datasets.')
 
